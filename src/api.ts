@@ -1,6 +1,6 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
-import { registerUser, createChallenge, verifySignature, simpleLogin } from './auth';
+import { registerUser, createChallenge, verifySignature, simpleLogin, verifyToken, generateToken } from './auth';
 import { prisma } from './database';
 import { RegisterRequest, ChallengeRequest, VerifyRequest } from './types';
 
@@ -79,6 +79,85 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('[API] Login error:', error);
     res.status(400).json({ error: error.message });
+  }
+});
+
+// Check if user exists
+app.get('/api/auth/exists/:username', async (req: Request, res: Response) => {
+  try {
+    const username = req.params.username as string;
+    
+    if (!username) {
+      return res.status(400).json({ error: 'Username required' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { username },
+      select: {
+        publicKeyEd25519: true,
+        publicKeyRsa: true,
+      },
+    });
+
+    if (!user) {
+      return res.json({ exists: false });
+    }
+
+    // Determine key type
+    let keyType: string | null = null;
+    if (user.publicKeyEd25519) {
+      keyType = 'ed25519';
+    } else if (user.publicKeyRsa) {
+      keyType = 'rsa';
+    }
+
+    res.json({ exists: true, keyType });
+  } catch (error: any) {
+    console.error('[API] User exists check error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Refresh token (requires valid token in Authorization header)
+app.post('/api/auth/refresh', async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+
+    const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+    const payload = verifyToken(token);
+    
+    if (!payload) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    // Verify user still exists
+    const user = await prisma.user.findUnique({
+      where: { id: payload.userId },
+    });
+
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    // Update last seen
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { lastSeen: new Date() },
+    });
+
+    // Generate new token with fresh expiry
+    const newToken = generateToken(user.id, user.username);
+    
+    console.log(`[AUTH] Token refreshed for user: ${user.username}`);
+    
+    res.json({ token: newToken });
+  } catch (error: any) {
+    console.error('[API] Token refresh error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 

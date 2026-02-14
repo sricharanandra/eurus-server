@@ -7,7 +7,7 @@ import { prisma } from './database';
 import { JWTPayload, RegisterRequest, RegisterResponse, ChallengeResponse, VerifyResponse } from './types';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
-const JWT_EXPIRES_IN = '7d';
+const JWT_EXPIRES_IN = '90d';
 
 // Store active challenges (username -> challenge)
 const activeChallenges = new Map<string, { challenge: string; timestamp: number }>();
@@ -216,7 +216,7 @@ export async function verifySignature(
 
       // Verify signature
       const md = forge.md.sha256.create();
-      md.update(challengeData.challenge, 'utf8');
+      md.update(Buffer.from(challengeData.challenge, 'hex').toString('binary'));
       
       const valid = rsaPublicKey.verify(
         md.digest().bytes(),
