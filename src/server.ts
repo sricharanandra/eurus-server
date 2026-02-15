@@ -1143,6 +1143,31 @@ async function handleLeaveRoom(user: ConnectedUser, payload: LeaveRoomPayload) {
   // Remove from active room
   const activeRoom = activeRooms.get(roomId);
   if (activeRoom) {
+    // Bug 3 fix: clean up voiceUsers and notify remaining voice users
+    if (activeRoom.voiceUsers?.has(user.userId)) {
+      activeRoom.voiceUsers.delete(user.userId);
+      broadcastVoiceState(roomId);
+
+      // Broadcast leave_voice to remaining voice users so they close the peer connection
+      const voiceMembers = activeRoom.users.filter(
+        roomUser => roomUser.userId !== user.userId && activeRoom.voiceUsers?.has(roomUser.userId)
+      );
+      voiceMembers.forEach(roomUser => {
+        if (roomUser.ws.readyState !== WebSocket.OPEN) return;
+        sendMessage(roomUser.ws, {
+          type: "voiceSignal",
+          payload: {
+            roomId,
+            senderUserId: user.userId,
+            senderUsername: user.username,
+            type: "leave_voice",
+            data: "",
+          },
+        });
+      });
+      console.log(`[VOICE] ${user.username} removed from voice in room ${roomId} (room leave)`);
+    }
+
     activeRoom.users = activeRoom.users.filter(u => u.userId !== user.userId);
 
     // Broadcast user left
