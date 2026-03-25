@@ -18,6 +18,12 @@ class RoomVoiceManager {
   }
 
   async joinVoice(user: ConnectedUser): Promise<void> {
+    // Skip if session already exists (offer may have created it first)
+    if (this.sessions.has(user.userId)) {
+      console.log(`[VOICE SFU] Session already exists for ${user.username}, skipping joinVoice`);
+      return;
+    }
+
     console.log(`[VOICE SFU] joinVoice called for ${user.username} in room ${this.roomId}`);
 
     const pc = new RTCPeerConnection({
