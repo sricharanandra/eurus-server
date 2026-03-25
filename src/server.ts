@@ -938,6 +938,13 @@ async function handleVoiceSignal(user: ConnectedUser, payload: VoiceSignalPayloa
     try {
       const offer = JSON.parse(data);
       console.log(`[VOICE SFU] Received offer from ${user.username}`);
+      
+      // Create session if it doesn't exist (offer may arrive before join_voice)
+      if (!room.voiceManager.getSession(user.userId)) {
+        console.log(`[VOICE SFU] Creating session on demand for ${user.username}`);
+        await room.voiceManager.joinVoice(user);
+      }
+      
       const answer = await room.voiceManager.handleOffer(user.userId, offer);
 
       // Send answer to client
