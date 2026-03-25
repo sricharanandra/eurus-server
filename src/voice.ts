@@ -17,7 +17,7 @@ class RoomVoiceManager {
     this.roomId = roomId;
   }
 
-  async joinVoice(user: ConnectedUser): Promise<RTCSessionDescription> {
+  async joinVoice(user: ConnectedUser): Promise<void> {
     console.log(`[VOICE SFU] joinVoice called for ${user.username} in room ${this.roomId}`);
 
     const pc = new RTCPeerConnection({
@@ -61,9 +61,9 @@ class RoomVoiceManager {
 
     pc.onicecandidate = (event: any) => {
       if (event.candidate) {
-        console.log(`[VOICE SFU] ICE candidate generated for ${user.username}: ${event.candidate.candidate}`);
+        console.log(`[VOICE SFU] ICE candidate for ${user.username}`);
       } else {
-        console.log(`[VOICE SFU] ICE candidate gathering complete for ${user.username}`);
+        console.log(`[VOICE SFU] ICE gathering complete for ${user.username}`);
       }
     };
 
@@ -71,22 +71,51 @@ class RoomVoiceManager {
       console.log(`[VOICE SFU] Connection state for ${user.username}: ${pc.connectionState}`);
     };
 
-    // Create offer and set as local description
-    const offer = await pc.createOffer();
-    console.log(`[VOICE SFU] Created offer for ${user.username}, SDP preview: ${offer.sdp.substring(0, 80)}...`);
-    await pc.setLocalDescription(offer);
-    console.log(`[VOICE SFU] Set local description for ${user.username}, ICE gathering state: ${pc.iceGatheringState}`);
+    console.log(`[VOICE SFU] ${user.username} joined, waiting for offer`);
+  }
 
-    // Wait for ICE gathering (max 2 seconds)
-    let waited = 0;
-    while (pc.iceGatheringState !== 'complete' && waited < 2000) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-      waited += 100;
+  async handleOffer(userId: string, offer: RTCSessionDescription): Promise<RTCSessionDescription> {
+    console.log(`[VOICE SFU] handleOffer from ${userId}`);
+    const session = this.sessions.get(userId);
+    if (!session) {
+      throw new Error(`No session for ${userId}`);
     }
-    console.log(`[VOICE SFU] Waited ${waited}ms, ICE gathering state: ${pc.iceGatheringState}`);
 
-    // Return the offer - client will handle it
-    return offer;
+    const pc = session.peerConnection;
+
+    // Set remote description (client's offer)
+    await pc.setRemoteDescription(offer);
+    console.log(`[VOICE SFU] Set remote description for ${userId}`);
+
+    // Create and set local answer
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    console.log(`[VOICE SFU] Created and set local answer for ${userId}`);
+
+    return answer;
+  }
+
+  async handleAnswer(userId: string, answer: RTCSessionDescription): Promise<void> {
+    console.log(`[VOICE SFU] handleAnswer from ${userId}`);
+    const session = this.sessions.get(userId);
+    if (!session) {
+      console.log(`[VOICE SFU] No session found for answer from ${userId}`);
+      return;
+    }
+
+    await session.peerConnection.setRemoteDescription(answer);
+    console.log(`[VOICE SFU] Set remote description (answer) for ${userId}`);
+  }
+
+  async handleIceCandidate(userId: string, candidate: any): Promise<void> {
+    const session = this.sessions.get(userId);
+    if (!session) {
+      console.log(`[VOICE SFU] No session for ICE candidate from ${userId}`);
+      return;
+    }
+
+    await session.peerConnection.addIceCandidate(candidate);
+    console.log(`[VOICE SFU] Added ICE candidate for ${userId}`);
   }
 
   async leaveVoice(userId: string): Promise<void> {
@@ -110,30 +139,6 @@ class RoomVoiceManager {
     for (const [otherId, otherSession] of this.sessions) {
       console.log(`[VOICE SFU] User ${otherId} still in voice`);
     }
-  }
-
-  async handleAnswer(userId: string, answer: RTCSessionDescription): Promise<void> {
-    console.log(`[VOICE SFU] handleAnswer called for ${userId}`);
-    const session = this.sessions.get(userId);
-    if (!session) {
-      console.log(`[VOICE SFU] No session found for answer from ${userId}`);
-      return;
-    }
-
-    await session.peerConnection.setRemoteDescription(answer);
-    console.log(`[VOICE SFU] Set remote description (answer) for ${userId}`);
-  }
-
-  async handleIceCandidate(userId: string, candidate: any): Promise<void> {
-    const session = this.sessions.get(userId);
-    if (!session) {
-      console.log(`[VOICE SFU] No session found for ICE candidate from ${userId}`);
-      return;
-    }
-
-    console.log(`[VOICE SFU] Adding ICE candidate from ${userId}: ${candidate.candidate}`);
-    await session.peerConnection.addIceCandidate(candidate);
-    console.log(`[VOICE SFU] Added ICE candidate for ${userId}`);
   }
 
   async destroy(): Promise<void> {

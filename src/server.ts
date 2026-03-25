@@ -898,26 +898,14 @@ async function handleVoiceSignal(user: ConnectedUser, payload: VoiceSignalPayloa
     room.voiceManager = new RoomVoiceManager(roomId);
   }
 
-  // User joining voice - create server-side PeerConnection
+  // User joining voice - create server-side PeerConnection and wait for offer
   if (type === 'join_voice') {
     console.log(`[VOICE SFU] Processing join_voice for ${user.username}`);
 
     try {
-      const offer = await room.voiceManager.joinVoice(user);
+      await room.voiceManager.joinVoice(user);
       broadcastVoiceState(roomId);
-
-      // Send SDP offer to the client (server initiates WebRTC)
-      sendMessage(user.ws, {
-        type: "voiceSignal",
-        payload: {
-          roomId,
-          senderUserId: 'server',
-          type: 'offer',
-          data: JSON.stringify(offer),
-        },
-      });
-
-      console.log(`[VOICE SFU] Sent offer to ${user.username}`);
+      console.log(`[VOICE SFU] ${user.username} joined voice, waiting for offer`);
     } catch (e) {
       console.error(`[VOICE SFU] Error joining voice for ${user.username}:`, e);
     }
@@ -941,6 +929,30 @@ async function handleVoiceSignal(user: ConnectedUser, payload: VoiceSignalPayloa
       broadcastVoiceState(roomId);
     } catch (e) {
       console.error(`[VOICE SFU] Error leaving voice for ${user.username}:`, e);
+    }
+    return;
+  }
+
+  // Handle SDP offer from client - SERVER SENDS ANSWER
+  if (type === 'offer') {
+    try {
+      const offer = JSON.parse(data);
+      console.log(`[VOICE SFU] Received offer from ${user.username}`);
+      const answer = await room.voiceManager.handleOffer(user.userId, offer);
+
+      // Send answer to client
+      sendMessage(user.ws, {
+        type: "voiceSignal",
+        payload: {
+          roomId,
+          senderUserId: 'server',
+          type: 'answer',
+          data: JSON.stringify(answer),
+        },
+      });
+      console.log(`[VOICE SFU] Sent answer to ${user.username}`);
+    } catch (e) {
+      console.error(`[VOICE SFU] Error handling offer from ${user.username}:`, e);
     }
     return;
   }
