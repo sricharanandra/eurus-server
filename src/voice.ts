@@ -71,11 +71,21 @@ class RoomVoiceManager {
       console.log(`[VOICE SFU] Connection state for ${user.username}: ${pc.connectionState}`);
     };
 
+    // Create offer and set as local description
     const offer = await pc.createOffer();
-    console.log(`[VOICE SFU] Created offer for ${user.username}`);
+    console.log(`[VOICE SFU] Created offer for ${user.username}, SDP preview: ${offer.sdp.substring(0, 80)}...`);
     await pc.setLocalDescription(offer);
-    console.log(`[VOICE SFU] Set local description for ${user.username}, sending offer`);
+    console.log(`[VOICE SFU] Set local description for ${user.username}, ICE gathering state: ${pc.iceGatheringState}`);
 
+    // Wait for ICE gathering (max 2 seconds)
+    let waited = 0;
+    while (pc.iceGatheringState !== 'complete' && waited < 2000) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      waited += 100;
+    }
+    console.log(`[VOICE SFU] Waited ${waited}ms, ICE gathering state: ${pc.iceGatheringState}`);
+
+    // Return the offer - client will handle it
     return offer;
   }
 
