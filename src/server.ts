@@ -24,6 +24,7 @@ import {
   VoiceSignalPayload,
   BaseMessage,
 } from './types';
+import { RoomVoiceManager } from './voice';
 import crypto from 'crypto';
 
 // Load environment variables
@@ -875,114 +876,101 @@ async function handleCreateDM(user: ConnectedUser, payload: CreateDMPayload) {
   await handleJoinRoom(user, { roomId: dmRoom.id });
 }
 
-function handleVoiceSignal(user: ConnectedUser, payload: VoiceSignalPayload) {
-  const { roomId, targetUserId, type, data } = payload;
+async function handleVoiceSignal(user: ConnectedUser, payload: VoiceSignalPayload) {
+  const { roomId, type, data } = payload;
 
   if (!roomId) return;
 
   const room = activeRooms.get(roomId);
   if (!room) return;
 
-  // Initialize voice set if missing
-  if (!room.voiceUsers) {
-    room.voiceUsers = new Set();
+  // Initialize SFU manager if missing
+  if (!room.voiceManager) {
+    room.voiceManager = new RoomVoiceManager(roomId);
   }
 
-  // Handle Voice State Updates
+  // User joining voice - create server-side PeerConnection
   if (type === 'join_voice') {
-    room.voiceUsers.add(user.userId);
-    broadcastVoiceState(roomId);
-    
-    // Broadcast 'join_voice' signal to room so others initiate P2P
-    const roomMembers = room.users.filter(roomUser => roomUser.userId !== user.userId);
-    roomMembers.forEach(roomUser => {
-      if (!room.voiceUsers?.has(roomUser.userId)) {
-        return;
-      }
-      if (roomUser.ws.readyState !== WebSocket.OPEN) {
-        return;
-      }
-      sendMessage(roomUser.ws, {
+    console.log(`[VOICE SFU] ${user.username} joining voice in room ${roomId}`);
+
+    try {
+      const offer = await room.voiceManager.joinVoice(user);
+      broadcastVoiceState(roomId);
+
+      // Send SDP offer to the client (server initiates WebRTC)
+      sendMessage(user.ws, {
         type: "voiceSignal",
         payload: {
           roomId,
-          senderUserId: user.userId,
-          senderUsername: user.username,
-          type,
-          data: "",
+          senderUserId: 'server',
+          type: 'offer',
+          data: JSON.stringify(offer),
         },
       });
-    });
 
-    console.log(`[VOICE] ${user.username} joined voice in room ${roomId}`);
+      console.log(`[VOICE SFU] Sent offer to ${user.username}`);
+    } catch (e) {
+      console.error(`[VOICE SFU] Error joining voice for ${user.username}:`, e);
+    }
     return;
   }
 
+  // User leaving voice - close server-side PeerConnection
   if (type === 'leave_voice') {
-    room.voiceUsers.delete(user.userId);
-    broadcastVoiceState(roomId);
-    
-    const roomMembers = room.users.filter(roomUser => roomUser.userId !== user.userId);
-    roomMembers.forEach(roomUser => {
-      if (!room.voiceUsers?.has(roomUser.userId)) {
-        return;
+    console.log(`[VOICE SFU] ${user.username} leaving voice in room ${roomId}`);
+
+    try {
+      await room.voiceManager.leaveVoice(user.userId);
+
+      // If no more users in voice, destroy the manager
+      if (room.voiceManager.getVoiceUsers().size === 0) {
+        await room.voiceManager.destroy();
+        room.voiceManager = undefined;
+        console.log(`[VOICE SFU] Voice session destroyed (room empty)`);
       }
-      if (roomUser.ws.readyState !== WebSocket.OPEN) {
-        return;
-      }
-      sendMessage(roomUser.ws, {
-        type: "voiceSignal",
-        payload: {
-          roomId,
-          senderUserId: user.userId,
-          senderUsername: user.username,
-          type,
-          data: "",
-        },
-      });
-    });
-    
-    console.log(`[VOICE] ${user.username} left voice in room ${roomId}`);
+
+      broadcastVoiceState(roomId);
+    } catch (e) {
+      console.error(`[VOICE SFU] Error leaving voice for ${user.username}:`, e);
+    }
     return;
   }
 
-  // Only allow voice signaling between users who joined voice
-  if (!room.voiceUsers.has(user.userId)) {
+  // Handle SDP answer from client
+  if (type === 'answer') {
+    try {
+      const answer = JSON.parse(data);
+      await room.voiceManager.handleAnswer(user.userId, answer);
+      console.log(`[VOICE SFU] Received answer from ${user.username}`);
+    } catch (e) {
+      console.error(`[VOICE SFU] Error handling answer from ${user.username}:`, e);
+    }
     return;
   }
 
-  // Handle P2P Signaling (Offer/Answer/Candidate)
-  // If targetUserId is set, forward ONLY to that user
-  if (targetUserId) {
-    if (!room.voiceUsers.has(targetUserId)) {
-      return;
+  // Handle ICE candidate from client
+  if (type === 'candidate') {
+    try {
+      const candidate = JSON.parse(data);
+      await room.voiceManager.handleIceCandidate(user.userId, candidate);
+    } catch (e) {
+      console.error(`[VOICE SFU] Error handling candidate from ${user.username}:`, e);
     }
-    const targetUser = room.users.find(u => u.userId === targetUserId);
-    if (targetUser && targetUser.ws.readyState === WebSocket.OPEN) {
-      sendMessage(targetUser.ws, {
-        type: "voiceSignal",
-        payload: {
-          roomId,
-          senderUserId: user.userId,
-          senderUsername: user.username, // Helpful for UI
-          type,
-          data
-        }
-      });
-      console.log(`[VOICE] Forwarded ${type} from ${user.username} to ${targetUser.username}`);
-    }
-  } else {
-    // If no target, broadcast to all (rare for signaling, usually specific)
-    // But maybe useful for initial discovery if 'join_voice' didn't suffice
+    return;
   }
+
+  console.log(`[VOICE SFU] Unknown signal type: ${type}`);
 }
 
 function broadcastVoiceState(roomId: string) {
   const room = activeRooms.get(roomId);
-  if (!room || !room.voiceUsers) return;
+  if (!room) return;
+
+  // Get voice users from SFU manager
+  const voiceUserIds = room.voiceManager?.getVoiceUsers() || new Set<string>();
 
   // Convert UserIDs to Usernames for UI display
-  const activeUsernames = Array.from(room.voiceUsers).map(userId => {
+  const activeUsernames = Array.from(voiceUserIds).map(userId => {
     const u = room.users.find(u => u.userId === userId);
     return u ? u.username : "Unknown";
   });
@@ -1143,29 +1131,23 @@ async function handleLeaveRoom(user: ConnectedUser, payload: LeaveRoomPayload) {
   // Remove from active room
   const activeRoom = activeRooms.get(roomId);
   if (activeRoom) {
-    // Bug 3 fix: clean up voiceUsers and notify remaining voice users
-    if (activeRoom.voiceUsers?.has(user.userId)) {
-      activeRoom.voiceUsers.delete(user.userId);
-      broadcastVoiceState(roomId);
+    // Clean up voice session if user was in voice
+    if (activeRoom.voiceManager) {
+      const voiceUsers = activeRoom.voiceManager.getVoiceUsers();
+      if (voiceUsers.has(user.userId)) {
+        activeRoom.voiceManager.leaveVoice(user.userId);
 
-      // Broadcast leave_voice to remaining voice users so they close the peer connection
-      const voiceMembers = activeRoom.users.filter(
-        roomUser => roomUser.userId !== user.userId && activeRoom.voiceUsers?.has(roomUser.userId)
-      );
-      voiceMembers.forEach(roomUser => {
-        if (roomUser.ws.readyState !== WebSocket.OPEN) return;
-        sendMessage(roomUser.ws, {
-          type: "voiceSignal",
-          payload: {
-            roomId,
-            senderUserId: user.userId,
-            senderUsername: user.username,
-            type: "leave_voice",
-            data: "",
-          },
-        });
-      });
-      console.log(`[VOICE] ${user.username} removed from voice in room ${roomId} (room leave)`);
+        if (voiceUsers.size === 1) {
+          // This was the last user, destroy the voice manager
+          activeRoom.voiceManager.destroy();
+          activeRoom.voiceManager = undefined;
+          console.log(`[VOICE SFU] ${user.username} left voice (last user, session destroyed)`);
+        } else {
+          console.log(`[VOICE SFU] ${user.username} left voice, ${voiceUsers.size - 1} remaining`);
+        }
+
+        broadcastVoiceState(roomId);
+      }
     }
 
     activeRoom.users = activeRoom.users.filter(u => u.userId !== user.userId);
@@ -1245,7 +1227,15 @@ httpServer.listen(PORT, HOST, () => {
 
 async function shutdown() {
   console.log('\n🛑 Shutting down server...');
-  
+
+  // Close all voice sessions
+  for (const [roomId, room] of activeRooms) {
+    if (room.voiceManager) {
+      await room.voiceManager.destroy();
+      console.log(`[VOICE SFU] Closed voice session for room ${roomId}`);
+    }
+  }
+
   // Close all WebSocket connections gracefully
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
@@ -1263,7 +1253,7 @@ async function shutdown() {
 
   await prisma.$disconnect();
   console.log('✅ Database disconnected');
-  
+
   process.exit(0);
 }
 

@@ -1,4 +1,5 @@
 import { WebSocket } from "ws";
+import { RoomVoiceManager } from "./voice";
 
 // ============================================================================
 // PROTOCOL TYPES - Fixed to use "type" and camelCase consistently
@@ -233,7 +234,7 @@ export interface ActiveRoom {
   roomType: string;
   encryptedKey: string;
   users: ConnectedUser[];
-  voiceUsers?: Set<string>; // UserIDs currently in voice
+  voiceManager?: RoomVoiceManager; // SFU manager for voice in this room
 }
 
 // ============================================================================
