@@ -18,6 +18,8 @@ class RoomVoiceManager {
   }
 
   async joinVoice(user: ConnectedUser): Promise<RTCSessionDescription> {
+    console.log(`[VOICE SFU] joinVoice called for ${user.username} in room ${this.roomId}`);
+
     const pc = new RTCPeerConnection({
       iceServers: [
         {
@@ -26,6 +28,8 @@ class RoomVoiceManager {
       ],
     });
 
+    console.log(`[VOICE SFU] Created RTCPeerConnection for ${user.username}`);
+
     const session: VoiceSession = {
       userId: user.userId,
       username: user.username,
@@ -33,15 +37,21 @@ class RoomVoiceManager {
       roomId: this.roomId,
     };
     this.sessions.set(user.userId, session);
+    console.log(`[VOICE SFU] Added session for ${user.username}, total sessions: ${this.sessions.size}`);
 
+    // Handle incoming tracks from this user
     pc.ontrack = (event: any) => {
       const track = event.track;
+      console.log(`[VOICE SFU] ontrack fired for ${user.username}, track kind: ${track.kind}`);
       session.audioTrack = track;
 
+      // Forward this track to all other users
       for (const [otherId, otherSession] of this.sessions) {
         if (otherId !== user.userId) {
           try {
+            console.log(`[VOICE SFU] Adding track from ${user.username} to ${otherId}`);
             otherSession.peerConnection.addTrack(track);
+            console.log(`[VOICE SFU] Successfully added track from ${user.username} to ${otherId}`);
           } catch (e) {
             console.log(`[VOICE SFU] Error adding track to ${otherId}:`, e);
           }
@@ -51,7 +61,9 @@ class RoomVoiceManager {
 
     pc.onicecandidate = (event: any) => {
       if (event.candidate) {
-        console.log(`[VOICE SFU] ICE candidate for ${user.username}`);
+        console.log(`[VOICE SFU] ICE candidate generated for ${user.username}: ${event.candidate.candidate}`);
+      } else {
+        console.log(`[VOICE SFU] ICE candidate gathering complete for ${user.username}`);
       }
     };
 
@@ -60,13 +72,15 @@ class RoomVoiceManager {
     };
 
     const offer = await pc.createOffer();
+    console.log(`[VOICE SFU] Created offer for ${user.username}`);
     await pc.setLocalDescription(offer);
+    console.log(`[VOICE SFU] Set local description for ${user.username}, sending offer`);
 
-    console.log(`[VOICE SFU] Created offer for ${user.username}, sessions: ${this.sessions.size}`);
     return offer;
   }
 
   async leaveVoice(userId: string): Promise<void> {
+    console.log(`[VOICE SFU] leaveVoice called for ${userId}`);
     const session = this.sessions.get(userId);
     if (!session) {
       console.log(`[VOICE SFU] No session found for userId: ${userId}`);
@@ -75,6 +89,7 @@ class RoomVoiceManager {
 
     try {
       await session.peerConnection.close();
+      console.log(`[VOICE SFU] Closed peer connection for ${userId}`);
     } catch (e) {
       console.log(`[VOICE SFU] Error closing PC for ${userId}:`, e);
     }
@@ -83,11 +98,12 @@ class RoomVoiceManager {
     console.log(`[VOICE SFU] User ${userId} left, remaining sessions: ${this.sessions.size}`);
 
     for (const [otherId, otherSession] of this.sessions) {
-      console.log(`[VOICE SFU] Noting user ${otherId} still in voice`);
+      console.log(`[VOICE SFU] User ${otherId} still in voice`);
     }
   }
 
   async handleAnswer(userId: string, answer: RTCSessionDescription): Promise<void> {
+    console.log(`[VOICE SFU] handleAnswer called for ${userId}`);
     const session = this.sessions.get(userId);
     if (!session) {
       console.log(`[VOICE SFU] No session found for answer from ${userId}`);
@@ -95,7 +111,7 @@ class RoomVoiceManager {
     }
 
     await session.peerConnection.setRemoteDescription(answer);
-    console.log(`[VOICE SFU] Set remote description for ${userId}`);
+    console.log(`[VOICE SFU] Set remote description (answer) for ${userId}`);
   }
 
   async handleIceCandidate(userId: string, candidate: any): Promise<void> {
@@ -105,6 +121,7 @@ class RoomVoiceManager {
       return;
     }
 
+    console.log(`[VOICE SFU] Adding ICE candidate from ${userId}: ${candidate.candidate}`);
     await session.peerConnection.addIceCandidate(candidate);
     console.log(`[VOICE SFU] Added ICE candidate for ${userId}`);
   }

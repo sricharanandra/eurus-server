@@ -198,7 +198,7 @@ wss.on("connection", async (ws: WebSocket, request) => {
           break;
 
         case "voiceSignal":
-          handleVoiceSignal(currentUser, message.payload);
+          await handleVoiceSignal(currentUser, message.payload);
           break;
 
         default:
@@ -879,19 +879,28 @@ async function handleCreateDM(user: ConnectedUser, payload: CreateDMPayload) {
 async function handleVoiceSignal(user: ConnectedUser, payload: VoiceSignalPayload) {
   const { roomId, type, data } = payload;
 
-  if (!roomId) return;
+  console.log(`[VOICE SFU] handleVoiceSignal called: type=${type}, user=${user.username}, roomId=${roomId}`);
+
+  if (!roomId) {
+    console.log(`[VOICE SFU] No roomId provided, returning`);
+    return;
+  }
 
   const room = activeRooms.get(roomId);
-  if (!room) return;
+  if (!room) {
+    console.log(`[VOICE SFU] Room ${roomId} not found, returning`);
+    return;
+  }
 
   // Initialize SFU manager if missing
   if (!room.voiceManager) {
+    console.log(`[VOICE SFU] Creating new RoomVoiceManager for room ${roomId}`);
     room.voiceManager = new RoomVoiceManager(roomId);
   }
 
   // User joining voice - create server-side PeerConnection
   if (type === 'join_voice') {
-    console.log(`[VOICE SFU] ${user.username} joining voice in room ${roomId}`);
+    console.log(`[VOICE SFU] Processing join_voice for ${user.username}`);
 
     try {
       const offer = await room.voiceManager.joinVoice(user);
@@ -974,6 +983,8 @@ function broadcastVoiceState(roomId: string) {
     const u = room.users.find(u => u.userId === userId);
     return u ? u.username : "Unknown";
   });
+
+  console.log(`[VOICE SFU] Broadcasting voiceState for room ${roomId}: ${JSON.stringify(activeUsernames)}`);
 
   broadcastToRoom(roomId, {
     type: "voiceState",
