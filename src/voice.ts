@@ -1,175 +1,156 @@
-import { RTCPeerConnection, RTCSessionDescription } from 'werift';
+import { OpusEncoder } from '@discordjs/opus';
+import { WebSocket } from 'ws';
 import { ConnectedUser } from './types';
 
-interface VoiceSession {
+const OPUS_SAMPLE_RATE = 48000;
+const OPUS_CHANNELS = 1;
+const FRAME_SIZE = 960; // 20ms at 48kHz
+
+interface VoiceUser {
   userId: string;
   username: string;
-  peerConnection: RTCPeerConnection;
-  audioTrack?: any;
-  roomId: string;
+  ws: WebSocket;
+  pcmBuffer: Float32Array;
 }
 
 class RoomVoiceManager {
-  private sessions: Map<string, VoiceSession> = new Map();
+  private users: Map<string, VoiceUser> = new Map();
   private roomId: string;
+  private encoder: OpusEncoder;
+  private decoder: OpusEncoder;
+  private mixInterval: NodeJS.Timeout | null = null;
 
   constructor(roomId: string) {
     this.roomId = roomId;
+    this.encoder = new OpusEncoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS);
+    this.decoder = new OpusEncoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS);
   }
 
-  async joinVoice(user: ConnectedUser): Promise<void> {
-    // Skip if session already exists (offer may have created it first)
-    if (this.sessions.has(user.userId)) {
-      console.log(`[VOICE SFU] Session already exists for ${user.username}, skipping joinVoice`);
-      return;
-    }
+  addUser(user: ConnectedUser): void {
+    console.log(`[VOICE] ${user.username} joined voice in room ${this.roomId}`);
 
-    console.log(`[VOICE SFU] joinVoice called for ${user.username} in room ${this.roomId}`);
-
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        {
-          urls: 'stun:stun.l.google.com:19302',
-        },
-      ],
-    });
-
-    console.log(`[VOICE SFU] Created RTCPeerConnection for ${user.username}`);
-
-    const session: VoiceSession = {
+    const voiceUser: VoiceUser = {
       userId: user.userId,
       username: user.username,
-      peerConnection: pc,
-      roomId: this.roomId,
+      ws: user.ws,
+      pcmBuffer: new Float32Array(FRAME_SIZE),
     };
-    this.sessions.set(user.userId, session);
-    console.log(`[VOICE SFU] Added session for ${user.username}, total sessions: ${this.sessions.size}`);
 
-    // Handle incoming tracks from this user
-    pc.ontrack = (event: any) => {
-      const track = event.track;
-      console.log(`[VOICE SFU] ontrack fired for ${user.username}, track kind: ${track.kind}`);
-      session.audioTrack = track;
+    this.users.set(user.userId, voiceUser);
 
-      // Forward this track to all other users
-      for (const [otherId, otherSession] of this.sessions) {
-        if (otherId !== user.userId) {
-          try {
-            console.log(`[VOICE SFU] Adding track from ${user.username} to ${otherId}`);
-            otherSession.peerConnection.addTrack(track);
-            console.log(`[VOICE SFU] Successfully added track from ${user.username} to ${otherId}`);
-          } catch (e) {
-            console.log(`[VOICE SFU] Error adding track to ${otherId}:`, e);
-          }
+    if (!this.mixInterval) {
+      this.startMixLoop();
+    }
+  }
+
+  removeUser(userId: string): void {
+    const user = this.users.get(userId);
+    if (user) {
+      console.log(`[VOICE] ${user.username} left voice in room ${this.roomId}`);
+      this.users.delete(userId);
+    }
+
+    if (this.users.size === 0 && this.mixInterval) {
+      clearInterval(this.mixInterval);
+      this.mixInterval = null;
+    }
+  }
+
+  processAudio(userId: string, opusData: Buffer): void {
+    const sender = this.users.get(userId);
+    if (!sender) return;
+
+    let decoded: Buffer;
+    try {
+      decoded = this.decoder.decode(opusData);
+    } catch (e) {
+      console.log(`[VOICE] Decode error from ${userId}:`, e);
+      return;
+    }
+
+    if (decoded.length < FRAME_SIZE * 2) return;
+
+    const floatBuf = new Float32Array(FRAME_SIZE);
+    for (let i = 0; i < FRAME_SIZE; i++) {
+      const sample = decoded.readInt16LE(i * 2);
+      floatBuf[i] = sample / 32768.0;
+    }
+    sender.pcmBuffer = floatBuf;
+  }
+
+  private startMixLoop(): void {
+    this.mixInterval = setInterval(() => {
+      this.mixAndSend();
+    }, 20);
+  }
+
+  private mixAndSend(): void {
+    if (this.users.size < 2) return;
+
+    const userIds = Array.from(this.users.keys());
+
+    for (const targetId of userIds) {
+      const target = this.users.get(targetId)!;
+      const mix = new Float32Array(FRAME_SIZE);
+
+      for (const sourceId of userIds) {
+        if (sourceId === targetId) continue;
+        const source = this.users.get(sourceId);
+        if (!source) continue;
+        for (let i = 0; i < FRAME_SIZE; i++) {
+          mix[i] += source.pcmBuffer[i];
         }
       }
-    };
 
-    pc.onicecandidate = (event: any) => {
-      if (event.candidate) {
-        console.log(`[VOICE SFU] ICE candidate for ${user.username}`);
-      } else {
-        console.log(`[VOICE SFU] ICE gathering complete for ${user.username}`);
+      const hasAudio = mix.some(s => Math.abs(s) > 0.001);
+      if (!hasAudio) continue;
+
+      const int16 = Buffer.alloc(FRAME_SIZE * 2);
+      for (let i = 0; i < FRAME_SIZE; i++) {
+        const clamped = Math.max(-1.0, Math.min(1.0, mix[i]));
+        int16.writeInt16LE(Math.round(clamped * 32767), i * 2);
       }
-    };
 
-    pc.onconnectionstatechange = () => {
-      console.log(`[VOICE SFU] Connection state for ${user.username}: ${pc.connectionState}`);
-    };
-
-    console.log(`[VOICE SFU] ${user.username} joined, waiting for offer`);
-  }
-
-  async handleOffer(userId: string, offer: RTCSessionDescription): Promise<RTCSessionDescription> {
-    console.log(`[VOICE SFU] handleOffer from ${userId}`);
-    const session = this.sessions.get(userId);
-    if (!session) {
-      throw new Error(`No session for ${userId}`);
-    }
-
-    const pc = session.peerConnection;
-
-    // Set remote description (client's offer)
-    await pc.setRemoteDescription(offer);
-    console.log(`[VOICE SFU] Set remote description for ${userId}`);
-
-    // Create and set local answer
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    console.log(`[VOICE SFU] Created and set local answer for ${userId}`);
-
-    return answer;
-  }
-
-  async handleAnswer(userId: string, answer: RTCSessionDescription): Promise<void> {
-    console.log(`[VOICE SFU] handleAnswer from ${userId}`);
-    const session = this.sessions.get(userId);
-    if (!session) {
-      console.log(`[VOICE SFU] No session found for answer from ${userId}`);
-      return;
-    }
-
-    await session.peerConnection.setRemoteDescription(answer);
-    console.log(`[VOICE SFU] Set remote description (answer) for ${userId}`);
-  }
-
-  async handleIceCandidate(userId: string, candidate: any): Promise<void> {
-    const session = this.sessions.get(userId);
-    if (!session) {
-      console.log(`[VOICE SFU] No session for ICE candidate from ${userId}`);
-      return;
-    }
-
-    await session.peerConnection.addIceCandidate(candidate);
-    console.log(`[VOICE SFU] Added ICE candidate for ${userId}`);
-  }
-
-  async leaveVoice(userId: string): Promise<void> {
-    console.log(`[VOICE SFU] leaveVoice called for ${userId}`);
-    const session = this.sessions.get(userId);
-    if (!session) {
-      console.log(`[VOICE SFU] No session found for userId: ${userId}`);
-      return;
-    }
-
-    try {
-      await session.peerConnection.close();
-      console.log(`[VOICE SFU] Closed peer connection for ${userId}`);
-    } catch (e) {
-      console.log(`[VOICE SFU] Error closing PC for ${userId}:`, e);
-    }
-
-    this.sessions.delete(userId);
-    console.log(`[VOICE SFU] User ${userId} left, remaining sessions: ${this.sessions.size}`);
-
-    for (const [otherId, otherSession] of this.sessions) {
-      console.log(`[VOICE SFU] User ${otherId} still in voice`);
-    }
-  }
-
-  async destroy(): Promise<void> {
-    console.log(`[VOICE SFU] Destroying RoomVoiceManager for room ${this.roomId}`);
-    for (const [userId, session] of this.sessions) {
+      let encoded: Buffer;
       try {
-        await session.peerConnection.close();
+        encoded = this.encoder.encode(int16);
       } catch (e) {
-        console.log(`[VOICE SFU] Error closing PC for ${userId}:`, e);
+        console.log(`[VOICE] Encode error for ${target.username}:`, e);
+        continue;
+      }
+
+      const payload = JSON.stringify({
+        type: 'voiceSignal',
+        payload: {
+          roomId: this.roomId,
+          senderUserId: 'server',
+          type: 'audio',
+          data: encoded.toString('base64'),
+        },
+      });
+
+      if (target.ws.readyState === 1) {
+        target.ws.send(payload);
       }
     }
-    this.sessions.clear();
   }
 
-  getVoiceUsers(): Set<string> {
-    return new Set(this.sessions.keys());
+  getVoiceUserIds(): Set<string> {
+    return new Set(this.users.keys());
   }
 
-  getSession(userId: string): VoiceSession | undefined {
-    return this.sessions.get(userId);
+  getVoiceUsernames(): string[] {
+    return Array.from(this.users.values()).map(u => u.username);
   }
 
-  getRoomId(): string {
-    return this.roomId;
+  destroy(): void {
+    console.log(`[VOICE] Destroying RoomVoiceManager for room ${this.roomId}`);
+    if (this.mixInterval) {
+      clearInterval(this.mixInterval);
+      this.mixInterval = null;
+    }
+    this.users.clear();
   }
 }
 
-export { RoomVoiceManager, VoiceSession };
+export { RoomVoiceManager };

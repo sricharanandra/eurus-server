@@ -879,131 +879,72 @@ async function handleCreateDM(user: ConnectedUser, payload: CreateDMPayload) {
 async function handleVoiceSignal(user: ConnectedUser, payload: VoiceSignalPayload) {
   const { roomId, type, data } = payload;
 
-  console.log(`[VOICE SFU] handleVoiceSignal called: type=${type}, user=${user.username}, roomId=${roomId}`);
+  console.log(`[VOICE] handleVoiceSignal: type=${type}, user=${user.username}, roomId=${roomId}`);
 
   if (!roomId) {
-    console.log(`[VOICE SFU] No roomId provided, returning`);
+    console.log(`[VOICE] No roomId provided, returning`);
     return;
   }
 
   const room = activeRooms.get(roomId);
   if (!room) {
-    console.log(`[VOICE SFU] Room ${roomId} not found, returning`);
+    console.log(`[VOICE] Room ${roomId} not found, returning`);
     return;
   }
 
-  // Initialize SFU manager if missing
   if (!room.voiceManager) {
-    console.log(`[VOICE SFU] Creating new RoomVoiceManager for room ${roomId}`);
+    console.log(`[VOICE] Creating new RoomVoiceManager for room ${roomId}`);
     room.voiceManager = new RoomVoiceManager(roomId);
   }
 
-  // User joining voice - create server-side PeerConnection and wait for offer
   if (type === 'join_voice') {
-    console.log(`[VOICE SFU] Processing join_voice for ${user.username}`);
-
+    console.log(`[VOICE] ${user.username} joining voice`);
     try {
-      await room.voiceManager.joinVoice(user);
+      room.voiceManager.addUser(user);
       broadcastVoiceState(roomId);
-      console.log(`[VOICE SFU] ${user.username} joined voice, waiting for offer`);
     } catch (e) {
-      console.error(`[VOICE SFU] Error joining voice for ${user.username}:`, e);
+      console.error(`[VOICE] Error adding ${user.username} to voice:`, e);
     }
     return;
   }
 
-  // User leaving voice - close server-side PeerConnection
   if (type === 'leave_voice') {
-    console.log(`[VOICE SFU] ${user.username} leaving voice in room ${roomId}`);
-
+    console.log(`[VOICE] ${user.username} leaving voice`);
     try {
-      await room.voiceManager.leaveVoice(user.userId);
-
-      // If no more users in voice, destroy the manager
-      if (room.voiceManager.getVoiceUsers().size === 0) {
-        await room.voiceManager.destroy();
-        room.voiceManager = undefined;
-        console.log(`[VOICE SFU] Voice session destroyed (room empty)`);
-      }
-
+      room.voiceManager.removeUser(user.userId);
       broadcastVoiceState(roomId);
-    } catch (e) {
-      console.error(`[VOICE SFU] Error leaving voice for ${user.username}:`, e);
-    }
-    return;
-  }
 
-  // Handle SDP offer from client - SERVER SENDS ANSWER
-  if (type === 'offer') {
-    try {
-      const offer = JSON.parse(data);
-      console.log(`[VOICE SFU] Received offer from ${user.username}`);
-      
-      // Create session if it doesn't exist (offer may arrive before join_voice)
-      if (!room.voiceManager.getSession(user.userId)) {
-        console.log(`[VOICE SFU] Creating session on demand for ${user.username}`);
-        await room.voiceManager.joinVoice(user);
+      if (room.voiceManager.getVoiceUserIds().size === 0) {
+        room.voiceManager.destroy();
+        room.voiceManager = undefined;
+        console.log(`[VOICE] Voice session destroyed (room empty)`);
       }
-      
-      const answer = await room.voiceManager.handleOffer(user.userId, offer);
-
-      // Send answer to client
-      sendMessage(user.ws, {
-        type: "voiceSignal",
-        payload: {
-          roomId,
-          senderUserId: 'server',
-          type: 'answer',
-          data: JSON.stringify(answer),
-        },
-      });
-      console.log(`[VOICE SFU] Sent answer to ${user.username}`);
     } catch (e) {
-      console.error(`[VOICE SFU] Error handling offer from ${user.username}:`, e);
+      console.error(`[VOICE] Error removing ${user.username} from voice:`, e);
     }
     return;
   }
 
-  // Handle SDP answer from client
-  if (type === 'answer') {
+  if (type === 'audio') {
     try {
-      const answer = JSON.parse(data);
-      await room.voiceManager.handleAnswer(user.userId, answer);
-      console.log(`[VOICE SFU] Received answer from ${user.username}`);
+      const opusData = Buffer.from(data, 'base64');
+      room.voiceManager.processAudio(user.userId, opusData);
     } catch (e) {
-      console.error(`[VOICE SFU] Error handling answer from ${user.username}:`, e);
+      console.error(`[VOICE] Error processing audio from ${user.username}:`, e);
     }
     return;
   }
 
-  // Handle ICE candidate from client
-  if (type === 'candidate') {
-    try {
-      const candidate = JSON.parse(data);
-      await room.voiceManager.handleIceCandidate(user.userId, candidate);
-    } catch (e) {
-      console.error(`[VOICE SFU] Error handling candidate from ${user.username}:`, e);
-    }
-    return;
-  }
-
-  console.log(`[VOICE SFU] Unknown signal type: ${type}`);
+  console.log(`[VOICE] Unknown signal type: ${type}`);
 }
 
 function broadcastVoiceState(roomId: string) {
   const room = activeRooms.get(roomId);
   if (!room) return;
 
-  // Get voice users from SFU manager
-  const voiceUserIds = room.voiceManager?.getVoiceUsers() || new Set<string>();
+  const activeUsernames = room.voiceManager?.getVoiceUsernames() || [];
 
-  // Convert UserIDs to Usernames for UI display
-  const activeUsernames = Array.from(voiceUserIds).map(userId => {
-    const u = room.users.find(u => u.userId === userId);
-    return u ? u.username : "Unknown";
-  });
-
-  console.log(`[VOICE SFU] Broadcasting voiceState for room ${roomId}: ${JSON.stringify(activeUsernames)}`);
+  console.log(`[VOICE] Broadcasting voiceState for room ${roomId}: ${JSON.stringify(activeUsernames)}`);
 
   broadcastToRoom(roomId, {
     type: "voiceState",
@@ -1163,17 +1104,17 @@ async function handleLeaveRoom(user: ConnectedUser, payload: LeaveRoomPayload) {
   if (activeRoom) {
     // Clean up voice session if user was in voice
     if (activeRoom.voiceManager) {
-      const voiceUsers = activeRoom.voiceManager.getVoiceUsers();
+      const voiceUsers = activeRoom.voiceManager.getVoiceUserIds();
       if (voiceUsers.has(user.userId)) {
-        activeRoom.voiceManager.leaveVoice(user.userId);
+        activeRoom.voiceManager.removeUser(user.userId);
 
         if (voiceUsers.size === 1) {
           // This was the last user, destroy the voice manager
           activeRoom.voiceManager.destroy();
           activeRoom.voiceManager = undefined;
-          console.log(`[VOICE SFU] ${user.username} left voice (last user, session destroyed)`);
+          console.log(`[VOICE] ${user.username} left voice (last user, session destroyed)`);
         } else {
-          console.log(`[VOICE SFU] ${user.username} left voice, ${voiceUsers.size - 1} remaining`);
+          console.log(`[VOICE] ${user.username} left voice, ${voiceUsers.size - 1} remaining`);
         }
 
         broadcastVoiceState(roomId);
