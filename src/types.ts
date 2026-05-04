@@ -1,5 +1,5 @@
 import { WebSocket } from "ws";
-import { RoomVoiceManager } from "./voice";
+import { RoomVoiceEngine } from "./voice";
 
 // ============================================================================
 // PROTOCOL TYPES - Fixed to use "type" and camelCase consistently
@@ -71,18 +71,44 @@ export interface CreateDMPayload {
   targetUsername: string;
 }
 
-export interface VoiceSignalPayload {
-  targetUserId?: string;
-  senderUserId?: string;
-  senderUsername?: string;
+// ============================================================================
+// VOICE PROTOCOL TYPES (Opus-over-WebSocket)
+// ============================================================================
+
+export interface JoinVoicePayload {
   roomId: string;
-  type: string; // "offer" | "answer" | "candidate" | "join_voice" | "leave_voice"
-  data: string;
+}
+
+export interface LeaveVoicePayload {
+  roomId: string;
+}
+
+export interface AudioPayload {
+  roomId: string;
+  seq: number;
+  timestamp: number;
+  payload: string; // Base64-encoded Opus
+}
+
+export interface ServerAudioPayload {
+  roomId: string;
+  userId: string;
+  seq: number;
+  timestamp: number;
+  payload: string; // Base64-encoded Opus
+}
+
+export interface VoiceJoinedPayload {
+  roomId: string;
+}
+
+export interface VoiceLeftPayload {
+  roomId: string;
 }
 
 export interface VoiceStatePayload {
   roomId: string;
-  activeUsers: string[]; // List of Usernames
+  activeUsers: string[];
 }
 
 export type ClientMessage =
@@ -98,7 +124,9 @@ export type ClientMessage =
   | BaseMessage<DeleteRoomPayload> & { type: "deleteRoom" }
   | BaseMessage<TransferOwnershipPayload> & { type: "transferOwnership" }
   | BaseMessage<CreateDMPayload> & { type: "createDM" }
-  | BaseMessage<VoiceSignalPayload> & { type: "voiceSignal" };
+  | BaseMessage<JoinVoicePayload> & { type: "join_voice" }
+  | BaseMessage<LeaveVoicePayload> & { type: "leave_voice" }
+  | BaseMessage<AudioPayload> & { type: "audio" };
 
 // ============================================================================
 // SERVER → CLIENT MESSAGES
@@ -212,8 +240,10 @@ export type ServerMessage =
   | BaseMessage<RoomRenamedPayload> & { type: "roomRenamed" }
   | BaseMessage<RoomDeletedPayload> & { type: "roomDeleted" }
   | BaseMessage<OwnershipTransferredPayload> & { type: "ownershipTransferred" }
-  | BaseMessage<VoiceSignalPayload> & { type: "voiceSignal" }
-  | BaseMessage<VoiceStatePayload> & { type: "voiceState" };
+  | BaseMessage<VoiceStatePayload> & { type: "voiceState" }
+  | BaseMessage<VoiceJoinedPayload> & { type: "voice_joined" }
+  | BaseMessage<VoiceLeftPayload> & { type: "voice_left" }
+  | BaseMessage<ServerAudioPayload> & { type: "audio" };
 
 // ============================================================================
 // SERVER STATE TYPES
@@ -234,7 +264,7 @@ export interface ActiveRoom {
   roomType: string;
   encryptedKey: string;
   users: ConnectedUser[];
-  voiceManager?: RoomVoiceManager; // SFU manager for voice in this room
+  voiceManager?: RoomVoiceEngine;
 }
 
 // ============================================================================

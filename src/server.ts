@@ -21,10 +21,12 @@ import {
   DeleteRoomPayload,
   TransferOwnershipPayload,
   CreateDMPayload,
-  VoiceSignalPayload,
+  JoinVoicePayload,
+  LeaveVoicePayload,
+  AudioPayload,
   BaseMessage,
 } from './types';
-import { RoomVoiceManager } from './voice';
+import { RoomVoiceEngine } from './voice';
 import crypto from 'crypto';
 
 // Load environment variables
@@ -197,8 +199,16 @@ wss.on("connection", async (ws: WebSocket, request) => {
           await handleCreateDM(currentUser, message.payload);
           break;
 
-        case "voiceSignal":
-          await handleVoiceSignal(currentUser, message.payload);
+        case "join_voice":
+          await handleJoinVoice(currentUser, message.payload);
+          break;
+
+        case "leave_voice":
+          await handleLeaveVoice(currentUser, message.payload);
+          break;
+
+        case "audio":
+          await handleAudio(currentUser, message.payload);
           break;
 
         default:
@@ -876,66 +886,102 @@ async function handleCreateDM(user: ConnectedUser, payload: CreateDMPayload) {
   await handleJoinRoom(user, { roomId: dmRoom.id });
 }
 
-async function handleVoiceSignal(user: ConnectedUser, payload: VoiceSignalPayload) {
-  const { roomId, type, data } = payload;
+async function handleJoinVoice(user: ConnectedUser, payload: JoinVoicePayload) {
+  const { roomId } = payload;
 
-  console.log(`[VOICE] handleVoiceSignal: type=${type}, user=${user.username}, roomId=${roomId}`);
+  console.log(`[VOICE] ${user.username} joining voice in room ${roomId}`);
 
   if (!roomId) {
-    console.log(`[VOICE] No roomId provided, returning`);
+    console.log(`[VOICE] No roomId provided`);
     return;
   }
 
   const room = activeRooms.get(roomId);
   if (!room) {
-    console.log(`[VOICE] Room ${roomId} not found, returning`);
+    console.log(`[VOICE] Room ${roomId} not found`);
     return;
   }
 
   if (!room.voiceManager) {
-    console.log(`[VOICE] Creating new RoomVoiceManager for room ${roomId}`);
-    room.voiceManager = new RoomVoiceManager(roomId);
+    console.log(`[VOICE] Creating new RoomVoiceEngine for room ${roomId}`);
+    room.voiceManager = new RoomVoiceEngine(roomId);
   }
 
-  if (type === 'join_voice') {
-    console.log(`[VOICE] ${user.username} joining voice`);
-    try {
-      room.voiceManager.addUser(user);
-      broadcastVoiceState(roomId);
-    } catch (e) {
-      console.error(`[VOICE] Error adding ${user.username} to voice:`, e);
-    }
+  try {
+    room.voiceManager.addUser(user.userId, user.username, user.ws);
+    broadcastVoiceState(roomId);
+    sendVoiceJoined(user.ws, roomId);
+  } catch (e) {
+    console.error(`[VOICE] Error adding ${user.username} to voice:`, e);
+  }
+}
+
+async function handleLeaveVoice(user: ConnectedUser, payload: LeaveVoicePayload) {
+  const { roomId } = payload;
+
+  console.log(`[VOICE] ${user.username} leaving voice in room ${roomId}`);
+
+  if (!roomId) {
+    console.log(`[VOICE] No roomId provided`);
     return;
   }
 
-  if (type === 'leave_voice') {
-    console.log(`[VOICE] ${user.username} leaving voice`);
-    try {
-      room.voiceManager.removeUser(user.userId);
-      broadcastVoiceState(roomId);
-
-      if (room.voiceManager.getVoiceUserIds().size === 0) {
-        room.voiceManager.destroy();
-        room.voiceManager = undefined;
-        console.log(`[VOICE] Voice session destroyed (room empty)`);
-      }
-    } catch (e) {
-      console.error(`[VOICE] Error removing ${user.username} from voice:`, e);
-    }
+  const room = activeRooms.get(roomId);
+  if (!room || !room.voiceManager) {
+    console.log(`[VOICE] Room or voice manager not found`);
     return;
   }
 
-  if (type === 'audio') {
-    try {
-      const opusData = Buffer.from(data, 'base64');
-      room.voiceManager.processAudio(user.userId, opusData);
-    } catch (e) {
-      console.error(`[VOICE] Error processing audio from ${user.username}:`, e);
+  try {
+    room.voiceManager.removeUser(user.userId);
+    broadcastVoiceState(roomId);
+    sendVoiceLeft(user.ws, roomId);
+
+    if (room.voiceManager.getVoiceUserIds().size === 0) {
+      room.voiceManager.destroy();
+      room.voiceManager = undefined;
+      console.log(`[VOICE] Voice session destroyed (room empty)`);
     }
+  } catch (e) {
+    console.error(`[VOICE] Error removing ${user.username} from voice:`, e);
+  }
+}
+
+async function handleAudio(user: ConnectedUser, payload: AudioPayload) {
+  const { roomId, seq, timestamp, payload: opusData } = payload;
+
+  if (!roomId) {
+    console.log(`[VOICE] No roomId in audio packet`);
     return;
   }
 
-  console.log(`[VOICE] Unknown signal type: ${type}`);
+  const room = activeRooms.get(roomId);
+  if (!room || !room.voiceManager) {
+    return;
+  }
+
+  try {
+    const opusBuffer = Buffer.from(opusData, 'base64');
+    room.voiceManager.processAudio(user.userId, seq, timestamp, opusBuffer);
+  } catch (e) {
+    console.error(`[VOICE] Error processing audio from ${user.username}:`, e);
+  }
+}
+
+function sendVoiceJoined(ws: WebSocket, roomId: string) {
+  const msg = JSON.stringify({
+    type: 'voice_joined',
+    payload: { roomId },
+  });
+  ws.send(msg);
+}
+
+function sendVoiceLeft(ws: WebSocket, roomId: string) {
+  const msg = JSON.stringify({
+    type: 'voice_left',
+    payload: { roomId },
+  });
+  ws.send(msg);
 }
 
 function broadcastVoiceState(roomId: string) {
