@@ -64,6 +64,11 @@ export class VoiceSession {
     return this.currentPcm;
   }
 
+  popMixedFrame(): Float32Array {
+    const frame = this.jitterBuffer.pop();
+    return frame ?? createSilenceFrame();
+  }
+
   encodeAndSend(pcm: Float32Array, seq: number, timestamp: number): void {
     if (!this.active || this.ws.readyState !== WebSocket.OPEN) {
       return;

@@ -121,6 +121,12 @@ wss.on("connection", async (ws: WebSocket, request) => {
 
   connectedUsers.set(ws, user);
 
+  // Heartbeat: mark alive, refresh on pong. Terminated after 2 missed pongs (~60s).
+  (ws as any).isAlive = true;
+  ws.on('pong', () => {
+    (ws as any).isAlive = true;
+  });
+
   // Send welcome message
   sendMessage(ws, {
     type: "info",
@@ -136,9 +142,11 @@ wss.on("connection", async (ws: WebSocket, request) => {
   ws.on("message", async (data: Buffer) => {
     try {
       const messageText = data.toString();
-      console.log(`[WS] ← Received from ${user?.username}:`, messageText);
-
       const message: ClientMessage = JSON.parse(messageText);
+
+      if (message.type !== 'audio') {
+        console.log(`[WS] ← Received from ${user?.username}:`, messageText);
+      }
 
       if (!message.type) {
         return sendError(ws, "Message missing 'type' field");
@@ -237,6 +245,24 @@ wss.on("connection", async (ws: WebSocket, request) => {
   ws.on("error", (error) => {
     console.error("[WS] WebSocket error:", error);
   });
+});
+
+// Heartbeat: ping every 30s, terminate after ~60s without pong.
+const HEARTBEAT_INTERVAL_MS = 30000;
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if ((ws as any).isAlive === false) {
+      console.log(`[WS] Heartbeat timeout, terminating connection`);
+      ws.terminate();
+      return;
+    }
+    (ws as any).isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_INTERVAL_MS);
+
+wss.on("close", () => {
+  clearInterval(heartbeatInterval);
 });
 
 // ============================================================================
@@ -735,6 +761,15 @@ async function handleDeleteRoom(user: ConnectedUser, payload: DeleteRoomPayload)
     data: { deletedAt: new Date() },
   });
 
+  // Tear down voice before notifying clients so they stop capture cleanly
+  const activeRoom = activeRooms.get(roomId);
+  if (activeRoom?.voiceManager) {
+    console.log(`[VOICE] Destroying voice engine for deleted room ${roomId}`);
+    activeRoom.voiceManager.destroy();
+    activeRoom.voiceManager = undefined;
+    broadcastVoiceState(roomId);
+  }
+
   // Notify all users in the room
   broadcastToRoom(roomId, {
     type: "roomDeleted",
@@ -1201,7 +1236,9 @@ function handleDisconnect(user: ConnectedUser) {
 function sendMessage(ws: WebSocket, message: ServerMessage) {
   if (ws.readyState === WebSocket.OPEN) {
     const json = JSON.stringify(message);
-    console.log(`[WS] → Sending:`, json);
+    if (message.type !== 'audio') {
+      console.log(`[WS] → Sending:`, json);
+    }
     ws.send(json);
   }
 }
@@ -1218,7 +1255,9 @@ function broadcastToRoom(roomId: string, message: ServerMessage, excludeWs?: Web
   if (!room) return;
 
   const json = JSON.stringify(message);
-  console.log(`[BROADCAST] To room ${roomId}:`, json);
+  if (message.type !== 'audio') {
+    console.log(`[BROADCAST] To room ${roomId}:`, json);
+  }
 
   room.users.forEach(user => {
     if (user.ws !== excludeWs && user.ws.readyState === WebSocket.OPEN) {

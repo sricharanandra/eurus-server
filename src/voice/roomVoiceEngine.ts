@@ -18,6 +18,12 @@ export class RoomVoiceEngine {
   }
 
   addUser(userId: string, username: string, ws: WebSocket): void {
+    const existing = this.sessions.get(userId);
+    if (existing) {
+      console.log(`[VOICE] Replacing existing session for ${username} (${userId}) in room ${this.roomId}`);
+      existing.destroy();
+    }
+
     console.log(`[VOICE] ${username} (${userId}) joined voice in room ${this.roomId}`);
 
     const session = new VoiceSession(userId, username, this.roomId, ws);
@@ -40,7 +46,7 @@ export class RoomVoiceEngine {
   processAudio(userId: string, seq: number, timestamp: number, opusData: Buffer): void {
     const session = this.sessions.get(userId);
     if (!session) {
-      console.log(`[VOICE] No session found for user ${userId}`);
+      // Stray packets after cleanup are expected; drop silently.
       return;
     }
 
@@ -70,10 +76,19 @@ export class RoomVoiceEngine {
     this.globalSeq++;
     this.globalTimestamp += TIMESTAMP_INCREMENT;
 
+    // Pop each user's frame ONCE per tick into a snapshot. Mixing directly
+    // from sessions would consume the jitter buffer N-1 times per tick,
+    // starving later targets of real audio.
+    const frames = new Map<string, Float32Array>();
+    for (const [userId, session] of this.sessions) {
+      if (!session.active) continue;
+      frames.set(userId, session.popMixedFrame());
+    }
+
     for (const [userId, session] of this.sessions) {
       if (!session.active) continue;
 
-      const mixedPcm = mixAudio(session, this.sessions);
+      const mixedPcm = mixAudio(userId, frames);
       session.encodeAndSend(mixedPcm, this.globalSeq, this.globalTimestamp);
     }
   }
