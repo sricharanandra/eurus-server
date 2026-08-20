@@ -119,6 +119,21 @@ wss.on("connection", async (ws: WebSocket, request) => {
     console.log(`[AUTH] Guest user created: ${guestUsername} (${dbUser.id})`);
   }
 
+  // Single-session enforcement: a second connection for the same userId
+  // replaces the first. Prevents zombie sockets whose delayed cleanup would
+  // rip the live session out of rooms/voice (cleanup filters by userId).
+  for (const [existingWs, existingUser] of connectedUsers) {
+    if (existingUser.userId === user.userId && existingWs !== ws) {
+      console.log(`[WS] Replacing existing connection for ${user.username}`);
+      connectedUsers.delete(existingWs);
+      try {
+        existingWs.terminate();
+      } catch (e) {
+        console.error(`[WS] Error terminating replaced connection:`, e);
+      }
+    }
+  }
+
   connectedUsers.set(ws, user);
 
   // Heartbeat: mark alive, refresh on pong. Terminated after 2 missed pongs (~60s).
@@ -252,12 +267,17 @@ const HEARTBEAT_INTERVAL_MS = 30000;
 const heartbeatInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if ((ws as any).isAlive === false) {
-      console.log(`[WS] Heartbeat timeout, terminating connection`);
+      const deadUser = connectedUsers.get(ws);
+      console.log(`[WS] Heartbeat timeout, terminating connection for ${deadUser?.username || 'unknown'}`);
       ws.terminate();
       return;
     }
     (ws as any).isAlive = false;
-    ws.ping();
+    try {
+      ws.ping();
+    } catch (e) {
+      console.error(`[WS] Ping error:`, e);
+    }
   });
 }, HEARTBEAT_INTERVAL_MS);
 
@@ -379,6 +399,18 @@ async function handleJoinRoom(user: ConnectedUser, payload: JoinRoomPayload) {
       onlineUsers,
     },
   });
+
+  // Send current voice roster so the joiner's sidebar isn't empty until
+  // the next voiceState broadcast
+  if (activeRoom.voiceManager) {
+    sendMessage(user.ws, {
+      type: "voiceState",
+      payload: {
+        roomId: room.id,
+        activeUsers: activeRoom.voiceManager.getVoiceUsernames(),
+      },
+    });
+  }
 
   // Broadcast to others in room
   broadcastToRoom(room.id, {

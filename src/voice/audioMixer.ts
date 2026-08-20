@@ -1,10 +1,11 @@
 const FRAME_SIZE = 960;
+const ACTIVE_THRESHOLD = 0.001;
 
 export function mixAudio(
   targetUserId: string,
   frames: Map<string, Float32Array>
 ): Float32Array {
-  let numSources = 0;
+  let activeSources = 0;
   let mix: Float32Array | null = null;
 
   for (const [userId, pcm] of frames) {
@@ -12,18 +13,24 @@ export function mixAudio(
     if (!mix) {
       mix = new Float32Array(FRAME_SIZE);
     }
+    let peak = 0;
     for (let i = 0; i < FRAME_SIZE; i++) {
       mix[i] += pcm[i];
+      const abs = pcm[i] < 0 ? -pcm[i] : pcm[i];
+      if (abs > peak) peak = abs;
     }
-    numSources++;
+    // Silent sources shouldn't dilute the gain of active speakers
+    if (peak > ACTIVE_THRESHOLD) {
+      activeSources++;
+    }
   }
 
-  if (!mix || numSources === 0) {
+  if (!mix || activeSources === 0) {
     return new Float32Array(FRAME_SIZE);
   }
 
   for (let i = 0; i < FRAME_SIZE; i++) {
-    mix[i] = mix[i] / numSources;
+    mix[i] = mix[i] / activeSources;
     mix[i] = Math.max(-1.0, Math.min(1.0, mix[i]));
   }
 
