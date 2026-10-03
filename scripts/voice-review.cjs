@@ -65,8 +65,8 @@ test('voice resumes after mute/unmute with packet sequence paused by the client'
   const session = new VoiceSession('speaker', 'speaker', 'room', socket());
   const encoder = new OpusEncoder(48000, 1);
   const pcm = tone();
-  const push = seq => session.processAudio(seq, seq * 20, encoder.encode(pcm));
-  push(0);
+  const push = () => session.processAudio(encoder.encode(pcm));
+  push();
   assert.ok(session.popMixedFrame().some(sample => Math.abs(sample) > 0.01));
   // Muted sender skips packets and does not increment seq. Mixer still ticks.
   for (let tick = 0; tick < 50; tick++) session.popMixedFrame();
@@ -75,7 +75,7 @@ test('voice resumes after mute/unmute with packet sequence paused by the client'
   console.log = () => {};
   try {
     for (let seq = 1; seq <= 100; seq++) {
-      push(seq);
+      push();
       if (session.popMixedFrame().some(sample => Math.abs(sample) > 0.01)) audible++;
     }
   } finally { console.log = originalLog; session.destroy(); }
@@ -90,7 +90,7 @@ test('single-side leave/rejoin keeps audio reaching every other participant', t 
   engine.addUser('a', 'a', a); engine.addUser('b', 'b', b); engine.addUser('c', 'c', c);
   for (let cycle = 0; cycle < 3; cycle++) {
     const encoder = new OpusEncoder(48000, 1);
-    engine.processAudio('a', 0, 0, encoder.encode(tone()));
+    engine.processAudio('a', encoder.encode(tone()));
     t.mock.timers.tick(20);
     for (const target of [b, c]) {
       const packet = target.messages.at(-1).payload.payload;

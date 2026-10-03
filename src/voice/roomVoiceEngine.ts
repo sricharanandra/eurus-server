@@ -43,14 +43,14 @@ export class RoomVoiceEngine {
     }
   }
 
-  processAudio(userId: string, seq: number, timestamp: number, opusData: Buffer): void {
+  processAudio(userId: string, opusData: Buffer): void {
     const session = this.sessions.get(userId);
     if (!session) {
       // Stray packets after cleanup are expected; drop silently.
       return;
     }
 
-    session.processAudio(seq, timestamp, opusData);
+    session.processAudio(opusData);
   }
 
   private startMixLoop(): void {

@@ -13,10 +13,7 @@ export class VoiceSession {
   public encoder: OpusEncoder;
   public decoder: OpusEncoder;
   public jitterBuffer: JitterBuffer;
-  public lastSeq: number = 0;
-  public lastTimestamp: number = 0;
   public active: boolean = true;
-  public currentPcm: Float32Array;
 
   private roomId: string;
 
@@ -28,14 +25,10 @@ export class VoiceSession {
     this.encoder = new OpusEncoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS);
     this.decoder = new OpusEncoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS);
     this.jitterBuffer = new JitterBuffer();
-    this.currentPcm = createSilenceFrame();
   }
 
-  processAudio(seq: number, timestamp: number, opusData: Buffer): void {
+  processAudio(opusData: Buffer): void {
     if (!this.active) return;
-
-    this.lastSeq = seq;
-    this.lastTimestamp = timestamp;
 
     let decoded: Buffer;
     try {
@@ -56,12 +49,7 @@ export class VoiceSession {
       floatBuf[i] = sample / 32768.0;
     }
 
-    this.currentPcm = floatBuf;
-    this.jitterBuffer.push(seq, floatBuf, timestamp);
-  }
-
-  getPcm(): Float32Array {
-    return this.currentPcm;
+    this.jitterBuffer.push(floatBuf);
   }
 
   popMixedFrame(): Float32Array {
@@ -124,6 +112,5 @@ export class VoiceSession {
   destroy(): void {
     this.active = false;
     this.jitterBuffer.reset();
-    this.currentPcm = createSilenceFrame();
   }
 }

@@ -1015,7 +1015,7 @@ async function handleLeaveVoice(user: ConnectedUser, payload: LeaveVoicePayload)
 }
 
 async function handleAudio(user: ConnectedUser, payload: AudioPayload) {
-  const { roomId, seq, timestamp, payload: opusData } = payload;
+  const { roomId, payload: opusData } = payload;
 
   if (!roomId) {
     console.log(`[VOICE] No roomId in audio packet`);
@@ -1029,7 +1029,7 @@ async function handleAudio(user: ConnectedUser, payload: AudioPayload) {
 
   try {
     const opusBuffer = Buffer.from(opusData, 'base64');
-    room.voiceManager.processAudio(user.userId, seq, timestamp, opusBuffer);
+    room.voiceManager.processAudio(user.userId, opusBuffer);
   } catch (e) {
     console.error(`[VOICE] Error processing audio from ${user.username}:`, e);
   }
