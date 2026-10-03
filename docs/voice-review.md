@@ -172,7 +172,7 @@ node scripts/voice-playback-review.cjs
 node scripts/voice-receive-review.cjs
 ```
 
-These audit checks assert correct behavior. They intentionally exit nonzero on the reviewed heads. They are not passing regression tests for a completed fix.
+These checks assert correct behavior. They exit nonzero on the reviewed heads. On `fix/voice-rejoin` in both repos they serve as the regression tests and all pass; harness signatures were updated where the fixes changed APIs.
 
 | Check | Observed result |
 |---|---|
@@ -183,7 +183,7 @@ These audit checks assert correct behavior. They intentionally exit nonzero on t
 | Playback callback audit | 1 passed, 1 failed |
 | Receive-loop audit | 0 passed, 1 failed |
 
-The server audit extracts actual handler declarations and the connection callback with the TypeScript parser, substitutes socket/database I/O, and uses real voice classes/native Opus. Mixer timers are virtual. It does not start the HTTP server. The Rust checks include unchanged production modules. The playback check compiles the actual callback with its unused device metadata type replaced. The receive check temporarily generates one Cargo test containing the unchanged UI receive block, runs it, and removes that generated file.
+The server audit extracts actual handler declarations and the connection callback with the TypeScript parser, substitutes socket/database I/O, and uses real voice classes/native Opus. Mixer timers are virtual. It does not start the HTTP server. The Rust checks include unchanged production modules. The playback check compiles the production output fill code: the callback on the reviewed head, `fill_output` on the fix branch. The receive check temporarily generates one Cargo test containing the unchanged UI receive block, runs it, and removes that generated file.
 
 No microphone, physical speaker, live database, full terminal session, or deployed service was tested. The reproduced failures establish specific code defects; they do not prove every historical rejoin report has the same cause.
 
