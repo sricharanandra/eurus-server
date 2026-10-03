@@ -1,5 +1,5 @@
 // Run: node --import tsx --test scripts/voice-review.cjs
-// Audit checks assert desired behavior and intentionally fail on unfixed bugs.
+// Regression checks for the voice lifecycle findings in docs/voice-review.md.
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { readFileSync } = require('node:fs');
@@ -22,7 +22,7 @@ function socket() {
 }
 
 function user(id, ws = socket()) {
-  return { userId: id, username: id, ws, currentRoomId: null, isAuthenticated: true };
+  return { userId: id, username: id, ws, currentRoomId: null, isAuthenticated: true, roomTransition: 0 };
 }
 
 // Load the actual handler declarations and connection callback, without executing
@@ -39,7 +39,7 @@ function handlers() {
   const context = {
     RoomVoiceEngine, WebSocket, Buffer, URL,
     console: { log() {}, error() {} },
-    activeRooms: new Map(), connectedUsers: new Map(),
+    activeRooms: new Map(), connectedUsers: new Map(), aliveSockets: new WeakSet(),
     verifyToken: id => ({ userId: id, username: id }),
     prisma: { room: { findFirst: async () => context.dbRoom }, roomMember: { upsert: async () => ({}) } },
     wss: { on(event, callback) { context.connect = callback; } },
@@ -90,7 +90,7 @@ test('single-side leave/rejoin keeps audio reaching every other participant', t 
   engine.addUser('a', 'a', a); engine.addUser('b', 'b', b); engine.addUser('c', 'c', c);
   for (let cycle = 0; cycle < 3; cycle++) {
     const encoder = new OpusEncoder(48000, 1);
-    engine.processAudio('a', encoder.encode(tone()));
+    engine.processAudio('a', a, encoder.encode(tone()));
     t.mock.timers.tick(20);
     for (const target of [b, c]) {
       const packet = target.messages.at(-1).payload.payload;
@@ -127,7 +127,7 @@ test('replacement connection cleans voice membership in the previous room', asyn
   r.voiceManager.addUser('a', 'a', old.ws);
   ctx.activeRooms.set('r', r);
   await ctx.connect(socket(), { url: '/ws?token=a', headers: { host: 'localhost' }, socket: {} });
-  assert.equal(r.voiceManager.getVoiceUserIds().has('a'), false, 'replaced user remains in old voice roster');
+  assert.equal(r.voiceManager?.getVoiceUserIds().has('a') ?? false, false, 'replaced user remains in old voice roster');
 });
 
 test('voice join requires active chat-room membership', async t => {
@@ -152,4 +152,19 @@ test('chat join completing after disconnect cannot resurrect a stale connection'
   resolveRoom({ ...room('r', []), members: [{}], messages: [] });
   await joining;
   assert.equal(ctx.activeRooms.get('r')?.users.some(u => u.ws === ws) ?? false, false, 'closed socket inserted after disconnect cleanup');
+});
+
+test('re-joining the current room keeps the voice session', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const ctx = handlers();
+  ctx.dbRoom = { ...room('r', []), members: [{}], messages: [] };
+  const ws = socket();
+  await ctx.connect(ws, { url: '/ws?token=a', headers: { host: 'localhost' }, socket: {} });
+  const current = ctx.connectedUsers.get(ws);
+  await ctx.handleJoinRoom(current, { roomId: 'r' });
+  ctx.handleJoinVoice(current, { roomId: 'r' });
+  t.after(() => ctx.activeRooms.get('r')?.voiceManager?.destroy());
+  assert.ok(ws.messages.some(m => m.type === 'voice_joined'), 'member was not admitted to voice');
+  await ctx.handleJoinRoom(current, { roomId: 'r' });
+  assert.equal(ctx.activeRooms.get('r')?.voiceManager?.hasSession('a', ws) ?? false, true, 'same-room join dropped the voice session');
 });

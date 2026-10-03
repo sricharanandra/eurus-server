@@ -50,6 +50,8 @@ console.log(`[STARTUP] Database: ${process.env.DATABASE_URL ? 'Configured' : 'No
 
 const connectedUsers = new Map<WebSocket, ConnectedUser>();
 const activeRooms = new Map<string, ActiveRoom>();
+// Sockets that answered the last heartbeat ping.
+const aliveSockets = new WeakSet<WebSocket>();
 
 // ============================================================================
 // HTTP + WEBSOCKET SERVER
@@ -75,6 +77,12 @@ console.log("=====================================================");
 wss.on("connection", async (ws: WebSocket, request) => {
   console.log(`[WS] New client connected from ${request.socket.remoteAddress}`);
 
+  // Heartbeat: mark alive, refresh on pong. Terminated after 2 missed pongs (~60s).
+  aliveSockets.add(ws);
+  ws.on('pong', () => {
+    aliveSockets.add(ws);
+  });
+
   // Parse token from query string
   const url = new URL(request.url || '', `http://${request.headers.host}`);
   const token = url.searchParams.get('token');
@@ -91,6 +99,7 @@ wss.on("connection", async (ws: WebSocket, request) => {
         ws,
         currentRoomId: null,
         isAuthenticated: true,
+        roomTransition: 0,
       };
       console.log(`[AUTH] User authenticated: ${user.username} (${user.userId})`);
     } else {
@@ -115,16 +124,25 @@ wss.on("connection", async (ws: WebSocket, request) => {
       ws,
       currentRoomId: null,
       isAuthenticated: false,
+      roomTransition: 0,
     };
     console.log(`[AUTH] Guest user created: ${guestUsername} (${dbUser.id})`);
   }
 
+  // The socket may have closed while the guest row was being created; its
+  // close event already fired, so registering it now would leak it.
+  if (ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
   // Single-session enforcement: a second connection for the same userId
-  // replaces the first. Prevents zombie sockets whose delayed cleanup would
-  // rip the live session out of rooms/voice (cleanup filters by userId).
+  // replaces the first. The old connection's room and voice membership is
+  // cleaned here, while it still owns its entry; once removed from
+  // connectedUsers its own close handler skips cleanup.
   for (const [existingWs, existingUser] of connectedUsers) {
     if (existingUser.userId === user.userId && existingWs !== ws) {
       console.log(`[WS] Replacing existing connection for ${user.username}`);
+      handleDisconnect(existingUser);
       connectedUsers.delete(existingWs);
       try {
         existingWs.terminate();
@@ -135,12 +153,6 @@ wss.on("connection", async (ws: WebSocket, request) => {
   }
 
   connectedUsers.set(ws, user);
-
-  // Heartbeat: mark alive, refresh on pong. Terminated after 2 missed pongs (~60s).
-  (ws as any).isAlive = true;
-  ws.on('pong', () => {
-    (ws as any).isAlive = true;
-  });
 
   // Send welcome message
   sendMessage(ws, {
@@ -187,7 +199,8 @@ wss.on("connection", async (ws: WebSocket, request) => {
           break;
 
         case "leaveRoom":
-          await handleLeaveRoom(currentUser, message.payload);
+          currentUser.roomTransition++;
+          handleLeaveRoom(currentUser, message.payload);
           break;
 
         case "listRooms":
@@ -223,15 +236,15 @@ wss.on("connection", async (ws: WebSocket, request) => {
           break;
 
         case "join_voice":
-          await handleJoinVoice(currentUser, message.payload);
+          handleJoinVoice(currentUser, message.payload);
           break;
 
         case "leave_voice":
-          await handleLeaveVoice(currentUser, message.payload);
+          handleLeaveVoice(currentUser, message.payload);
           break;
 
         case "audio":
-          await handleAudio(currentUser, message.payload);
+          handleAudio(currentUser, message.payload);
           break;
 
         default:
@@ -266,13 +279,13 @@ wss.on("connection", async (ws: WebSocket, request) => {
 const HEARTBEAT_INTERVAL_MS = 30000;
 const heartbeatInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
-    if ((ws as any).isAlive === false) {
+    if (!aliveSockets.has(ws)) {
       const deadUser = connectedUsers.get(ws);
       console.log(`[WS] Heartbeat timeout, terminating connection for ${deadUser?.username || 'unknown'}`);
       ws.terminate();
       return;
     }
-    (ws as any).isAlive = false;
+    aliveSockets.delete(ws);
     try {
       ws.ping();
     } catch (e) {
@@ -289,70 +302,38 @@ wss.on("close", () => {
 // MESSAGE HANDLERS
 // ============================================================================
 
-async function handleJoinRoom(user: ConnectedUser, payload: JoinRoomPayload) {
-  const { roomId, roomName } = payload;
+// Starts a room transition for this connection. The returned check is false
+// once the connection is closed or replaced, or a newer join/leave started,
+// so a slow database lookup can't apply an outdated join.
+function beginRoomTransition(user: ConnectedUser): () => boolean {
+  const transition = ++user.roomTransition;
+  return () => isCurrent(user) && user.roomTransition === transition;
+}
 
-  if (!roomId && !roomName) {
-    return sendError(user.ws, "Room ID or room name is required");
+// True while this ConnectedUser still owns an open socket.
+function isCurrent(user: ConnectedUser): boolean {
+  return connectedUsers.get(user.ws) === user && user.ws.readyState === WebSocket.OPEN;
+}
+
+type RoomWithHistory = {
+  id: string;
+  name: string;
+  displayName: string;
+  roomType: string;
+  encryptedKey: string | null;
+  messages: { id: string; ciphertext: string; createdAt: Date; sender: { username: string } }[];
+};
+
+// Moves the connection into a room: leaves its current room, joins the active
+// room, and sends history, roster and voice state. Re-entering the current
+// room only resends state, so an active voice session survives. Synchronous
+// so the transition can't interleave with other handlers.
+function enterRoom(user: ConnectedUser, room: RoomWithHistory) {
+  const rejoining = user.currentRoomId === room.id && !!activeRooms.get(room.id)?.users.includes(user);
+  if (user.currentRoomId && !rejoining) {
+    handleLeaveRoom(user, { roomId: user.currentRoomId });
   }
 
-  console.log(`[ROOM] ${user.username} attempting to join room: ${roomId || roomName}`);
-
-  // Check if room exists in database (by ID or name)
-  const room = await prisma.room.findFirst({
-    where: {
-      OR: [
-        roomId ? { id: roomId } : {},
-        roomName ? { name: roomName } : {},
-      ],
-      deletedAt: null,
-    },
-    include: {
-      messages: {
-        include: {
-          sender: {
-            select: { username: true },
-          },
-        },
-        orderBy: { createdAt: 'desc' },
-        take: 50,
-      },
-      members: {
-        where: { userId: user.userId },
-      },
-    },
-  });
-
-  if (!room) {
-    return sendError(user.ws, "Room not found");
-  }
-
-  // Check if room is private and user is not a member
-  if (room.roomType === 'private' && room.members.length === 0) {
-    return sendError(user.ws, "You don't have access to this private room");
-  }
-
-  // Leave current room if in one
-  if (user.currentRoomId) {
-    await handleLeaveRoom(user, { roomId: user.currentRoomId });
-  }
-
-  // Add user to room membership in database
-  await prisma.roomMember.upsert({
-    where: {
-      roomId_userId: {
-        roomId: room.id,
-        userId: user.userId,
-      },
-    },
-    create: {
-      roomId: room.id,
-      userId: user.userId,
-    },
-    update: {},
-  });
-
-  // Create or get active room
   let activeRoom = activeRooms.get(room.id);
   if (!activeRoom) {
     activeRoom = {
@@ -366,13 +347,11 @@ async function handleJoinRoom(user: ConnectedUser, payload: JoinRoomPayload) {
     activeRooms.set(room.id, activeRoom);
   }
 
-  // Add user to active room
-  if (!activeRoom.users.find(u => u.userId === user.userId)) {
-    activeRoom.users.push(user);
-  }
+  // Replace any stale entry for this user so broadcasts reach the live socket
+  activeRoom.users = activeRoom.users.filter(u => u.userId !== user.userId);
+  activeRoom.users.push(user);
   user.currentRoomId = room.id;
 
-  // Send room joined confirmation with message history and encryption key
   // Messages are fetched in desc order (newest first), reverse for chronological display
   const messages = room.messages.map(m => ({
     id: m.id,
@@ -381,7 +360,6 @@ async function handleJoinRoom(user: ConnectedUser, payload: JoinRoomPayload) {
     timestamp: m.createdAt.toISOString(),
   })).reverse();
 
-  // Get online users in the room
   const onlineUsers = activeRoom.users.map(u => ({
     username: u.username,
     userId: u.userId,
@@ -412,16 +390,80 @@ async function handleJoinRoom(user: ConnectedUser, payload: JoinRoomPayload) {
     });
   }
 
-  // Broadcast to others in room
-  broadcastToRoom(room.id, {
-    type: "userJoined",
-    payload: {
-      username: user.username,
+  if (!rejoining) {
+    broadcastToRoom(room.id, {
+      type: "userJoined",
+      payload: {
+        username: user.username,
+        userId: user.userId,
+      },
+    }, user.ws);
+  }
+}
+
+async function handleJoinRoom(user: ConnectedUser, payload: JoinRoomPayload) {
+  const { roomId, roomName } = payload;
+
+  if (!roomId && !roomName) {
+    return sendError(user.ws, "Room ID or room name is required");
+  }
+
+  console.log(`[ROOM] ${user.username} attempting to join room: ${roomId || roomName}`);
+  const isLatest = beginRoomTransition(user);
+
+  // Check if room exists in database (by ID or name)
+  const room = await prisma.room.findFirst({
+    where: {
+      OR: [
+        roomId ? { id: roomId } : {},
+        roomName ? { name: roomName } : {},
+      ],
+      deletedAt: null,
+    },
+    include: {
+      messages: {
+        include: {
+          sender: {
+            select: { username: true },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      },
+      members: {
+        where: { userId: user.userId },
+      },
+    },
+  });
+
+  if (!isLatest()) return;
+
+  if (!room) {
+    return sendError(user.ws, "Room not found");
+  }
+
+  // Check if room is private and user is not a member
+  if (room.roomType === 'private' && room.members.length === 0) {
+    return sendError(user.ws, "You don't have access to this private room");
+  }
+
+  // Add user to room membership in database
+  await prisma.roomMember.upsert({
+    where: {
+      roomId_userId: {
+        roomId: room.id,
+        userId: user.userId,
+      },
+    },
+    create: {
+      roomId: room.id,
       userId: user.userId,
     },
-  }, user.ws);
+    update: {},
+  });
 
-  console.log(`[ROOM] ${user.username} joined room: ${room.displayName} (${room.id})`);
+  if (!isLatest()) return;
+  enterRoom(user, room);
 }
 
 async function handleSendMessage(user: ConnectedUser, payload: SendMessagePayload) {
@@ -575,6 +617,8 @@ async function handleJoinViaInvite(user: ConnectedUser, payload: JoinViaInvitePa
     return sendError(user.ws, "Invite code is required");
   }
 
+  const isLatest = beginRoomTransition(user);
+
   // Find the invite
   const invite = await prisma.roomInvite.findUnique({
     where: { code: code.toUpperCase() },
@@ -647,65 +691,8 @@ async function handleJoinViaInvite(user: ConnectedUser, payload: JoinViaInvitePa
 
   console.log(`[INVITE] ${user.username} joined room ${invite.room.displayName} via invite ${code}`);
 
-  // Leave current room if in one
-  if (user.currentRoomId) {
-    await handleLeaveRoom(user, { roomId: user.currentRoomId });
-  }
-
-  // Create or get active room
-  let activeRoom = activeRooms.get(invite.room.id);
-  if (!activeRoom) {
-    activeRoom = {
-      id: invite.room.id,
-      name: invite.room.name,
-      displayName: invite.room.displayName,
-      roomType: invite.room.roomType,
-      encryptedKey: invite.room.encryptedKey || '',
-      users: [],
-    };
-    activeRooms.set(invite.room.id, activeRoom);
-  }
-
-  // Add user to active room
-  if (!activeRoom.users.find(u => u.userId === user.userId)) {
-    activeRoom.users.push(user);
-  }
-  user.currentRoomId = invite.room.id;
-
-  // Send room joined confirmation
-  const messages = invite.room.messages.map(m => ({
-    id: m.id,
-    username: m.sender.username,
-    ciphertext: m.ciphertext,
-    timestamp: m.createdAt.toISOString(),
-  })).reverse();
-
-  const onlineUsers = activeRoom.users.map(u => ({
-    username: u.username,
-    userId: u.userId,
-  }));
-
-  sendMessage(user.ws, {
-    type: "roomJoined",
-    payload: {
-      roomId: invite.room.id,
-      roomName: invite.room.name,
-      displayName: invite.room.displayName,
-      roomType: invite.room.roomType,
-      encryptedKey: invite.room.encryptedKey || '',
-      messages,
-      onlineUsers,
-    },
-  });
-
-  // Broadcast to others in room
-  broadcastToRoom(invite.room.id, {
-    type: "userJoined",
-    payload: {
-      username: user.username,
-      userId: user.userId,
-    },
-  }, user.ws);
+  if (!isLatest()) return;
+  enterRoom(user, invite.room);
 }
 
 async function handleRenameRoom(user: ConnectedUser, payload: RenameRoomPayload) {
@@ -809,6 +796,9 @@ async function handleDeleteRoom(user: ConnectedUser, payload: DeleteRoomPayload)
   });
 
   // Remove from active rooms cache
+  activeRoom?.users.forEach(u => {
+    if (u.currentRoomId === roomId) u.currentRoomId = null;
+  });
   activeRooms.delete(roomId);
 
   console.log(`[ROOM] ${user.username} deleted room ${room.name}`);
@@ -953,20 +943,42 @@ async function handleCreateDM(user: ConnectedUser, payload: CreateDMPayload) {
   await handleJoinRoom(user, { roomId: dmRoom.id });
 }
 
-async function handleJoinVoice(user: ConnectedUser, payload: JoinVoicePayload) {
+// Voice is only available to the connection that currently holds chat
+// membership in the room; private-room access comes from the chat join.
+function voiceRoomFor(user: ConnectedUser, roomId: string | undefined): ActiveRoom | undefined {
+  if (!roomId || !isCurrent(user) || user.currentRoomId !== roomId) return undefined;
+  const room = activeRooms.get(roomId);
+  return room?.users.includes(user) ? room : undefined;
+}
+
+// Removes this connection's voice session from the room, destroying the
+// engine when it empties. Returns false when it had no session there.
+function removeFromVoice(user: ConnectedUser, room: ActiveRoom): boolean {
+  const engine = room.voiceManager;
+  if (!engine || !engine.hasSession(user.userId, user.ws)) return false;
+
+  engine.removeUser(user.userId);
+  if (engine.getVoiceUserIds().size === 0) {
+    engine.destroy();
+    room.voiceManager = undefined;
+    console.log(`[VOICE] Voice session destroyed for room ${room.id} (empty)`);
+  }
+  broadcastVoiceState(room.id);
+  return true;
+}
+
+function handleJoinVoice(user: ConnectedUser, payload: JoinVoicePayload) {
   const { roomId } = payload;
 
   console.log(`[VOICE] ${user.username} joining voice in room ${roomId}`);
 
-  if (!roomId) {
-    console.log(`[VOICE] No roomId provided`);
-    return;
-  }
-
-  const room = activeRooms.get(roomId);
+  const room = voiceRoomFor(user, roomId);
   if (!room) {
-    console.log(`[VOICE] Room ${roomId} not found`);
-    return;
+    console.log(`[VOICE] Rejected join from ${user.username}: not in room ${roomId}`);
+    return sendMessage(user.ws, {
+      type: "voice_error",
+      payload: { roomId: roomId || '', message: "Join the room before joining voice" },
+    });
   }
 
   if (!room.voiceManager) {
@@ -977,48 +989,33 @@ async function handleJoinVoice(user: ConnectedUser, payload: JoinVoicePayload) {
   try {
     room.voiceManager.addUser(user.userId, user.username, user.ws);
     broadcastVoiceState(roomId);
-    sendVoiceJoined(user.ws, roomId);
+    sendMessage(user.ws, { type: "voice_joined", payload: { roomId } });
   } catch (e) {
     console.error(`[VOICE] Error adding ${user.username} to voice:`, e);
+    sendMessage(user.ws, {
+      type: "voice_error",
+      payload: { roomId, message: "Server failed to start voice" },
+    });
   }
 }
 
-async function handleLeaveVoice(user: ConnectedUser, payload: LeaveVoicePayload) {
+function handleLeaveVoice(user: ConnectedUser, payload: LeaveVoicePayload) {
   const { roomId } = payload;
 
   console.log(`[VOICE] ${user.username} leaving voice in room ${roomId}`);
 
-  if (!roomId) {
-    console.log(`[VOICE] No roomId provided`);
-    return;
-  }
-
-  const room = activeRooms.get(roomId);
-  if (!room || !room.voiceManager) {
-    console.log(`[VOICE] Room or voice manager not found`);
-    return;
-  }
-
-  try {
-    room.voiceManager.removeUser(user.userId);
-    broadcastVoiceState(roomId);
-    sendVoiceLeft(user.ws, roomId);
-
-    if (room.voiceManager.getVoiceUserIds().size === 0) {
-      room.voiceManager.destroy();
-      room.voiceManager = undefined;
-      console.log(`[VOICE] Voice session destroyed (room empty)`);
-    }
-  } catch (e) {
-    console.error(`[VOICE] Error removing ${user.username} from voice:`, e);
+  // Leaving a room already moves the user out of its voice; a late
+  // leave_voice for that room has nothing left to do.
+  const room = voiceRoomFor(user, roomId);
+  if (room && removeFromVoice(user, room)) {
+    sendMessage(user.ws, { type: "voice_left", payload: { roomId } });
   }
 }
 
-async function handleAudio(user: ConnectedUser, payload: AudioPayload) {
+function handleAudio(user: ConnectedUser, payload: AudioPayload) {
   const { roomId, payload: opusData } = payload;
 
-  if (!roomId) {
-    console.log(`[VOICE] No roomId in audio packet`);
+  if (!roomId || user.currentRoomId !== roomId) {
     return;
   }
 
@@ -1029,26 +1026,10 @@ async function handleAudio(user: ConnectedUser, payload: AudioPayload) {
 
   try {
     const opusBuffer = Buffer.from(opusData, 'base64');
-    room.voiceManager.processAudio(user.userId, opusBuffer);
+    room.voiceManager.processAudio(user.userId, user.ws, opusBuffer);
   } catch (e) {
     console.error(`[VOICE] Error processing audio from ${user.username}:`, e);
   }
-}
-
-function sendVoiceJoined(ws: WebSocket, roomId: string) {
-  const msg = JSON.stringify({
-    type: 'voice_joined',
-    payload: { roomId },
-  });
-  ws.send(msg);
-}
-
-function sendVoiceLeft(ws: WebSocket, roomId: string) {
-  const msg = JSON.stringify({
-    type: 'voice_left',
-    payload: { roomId },
-  });
-  ws.send(msg);
 }
 
 function broadcastVoiceState(roomId: string) {
@@ -1203,7 +1184,7 @@ async function handleListRooms(user: ConnectedUser, payload: ListRoomsPayload) {
   console.log(`[ROOM] Sent room list to ${user.username}: ${publicRooms.length} public, ${privateRooms.length} private`);
 }
 
-async function handleLeaveRoom(user: ConnectedUser, payload: LeaveRoomPayload) {
+function handleLeaveRoom(user: ConnectedUser, payload: LeaveRoomPayload) {
   const { roomId } = payload;
 
   if (!roomId) {
@@ -1212,31 +1193,14 @@ async function handleLeaveRoom(user: ConnectedUser, payload: LeaveRoomPayload) {
 
   console.log(`[ROOM] ${user.username} leaving room ${roomId}`);
 
-  // Remove from active room
   const activeRoom = activeRooms.get(roomId);
-  if (activeRoom) {
-    // Clean up voice session if user was in voice
-    if (activeRoom.voiceManager) {
-      const voiceUsers = activeRoom.voiceManager.getVoiceUserIds();
-      if (voiceUsers.has(user.userId)) {
-        activeRoom.voiceManager.removeUser(user.userId);
+  if (activeRoom && activeRoom.users.includes(user)) {
+    removeFromVoice(user, activeRoom);
 
-        if (voiceUsers.size === 1) {
-          // This was the last user, destroy the voice manager
-          activeRoom.voiceManager.destroy();
-          activeRoom.voiceManager = undefined;
-          console.log(`[VOICE] ${user.username} left voice (last user, session destroyed)`);
-        } else {
-          console.log(`[VOICE] ${user.username} left voice, ${voiceUsers.size - 1} remaining`);
-        }
+    // Match by connection, not userId, so a stale connection can't remove
+    // the user's live one
+    activeRoom.users = activeRoom.users.filter(u => u !== user);
 
-        broadcastVoiceState(roomId);
-      }
-    }
-
-    activeRoom.users = activeRoom.users.filter(u => u.userId !== user.userId);
-
-    // Broadcast user left
     broadcastToRoom(roomId, {
       type: "userLeft",
       payload: {
@@ -1247,15 +1211,19 @@ async function handleLeaveRoom(user: ConnectedUser, payload: LeaveRoomPayload) {
 
     // Remove active room if empty
     if (activeRoom.users.length === 0) {
+      activeRoom.voiceManager?.destroy();
       activeRooms.delete(roomId);
       console.log(`[ROOM] Active room ${roomId} removed (no users)`);
     }
   }
 
-  user.currentRoomId = null;
+  if (user.currentRoomId === roomId) {
+    user.currentRoomId = null;
+  }
 }
 
 function handleDisconnect(user: ConnectedUser) {
+  user.roomTransition++;
   if (user.currentRoomId) {
     handleLeaveRoom(user, { roomId: user.currentRoomId });
   }

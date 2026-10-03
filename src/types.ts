@@ -106,6 +106,11 @@ export interface VoiceLeftPayload {
   roomId: string;
 }
 
+export interface VoiceErrorPayload {
+  roomId: string;
+  message: string;
+}
+
 export interface VoiceStatePayload {
   roomId: string;
   activeUsers: string[];
@@ -243,6 +248,7 @@ export type ServerMessage =
   | BaseMessage<VoiceStatePayload> & { type: "voiceState" }
   | BaseMessage<VoiceJoinedPayload> & { type: "voice_joined" }
   | BaseMessage<VoiceLeftPayload> & { type: "voice_left" }
+  | BaseMessage<VoiceErrorPayload> & { type: "voice_error" }
   | BaseMessage<ServerAudioPayload> & { type: "audio" };
 
 // ============================================================================
@@ -255,6 +261,9 @@ export interface ConnectedUser {
   ws: WebSocket;
   currentRoomId: string | null;
   isAuthenticated: boolean;
+  // Bumped on every room join/leave request; a join that finishes its
+  // database work after a newer transition started must not apply.
+  roomTransition: number;
 }
 
 export interface ActiveRoom {
