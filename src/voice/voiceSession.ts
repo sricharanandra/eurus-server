@@ -5,6 +5,9 @@ import { JitterBuffer, createSilenceFrame } from './jitterBuffer';
 const OPUS_SAMPLE_RATE = 48000;
 const OPUS_CHANNELS = 1;
 const FRAME_SIZE = 960;
+// Skip mixed frames while the socket backlog exceeds ~1s of audio so a stalled
+// client can't grow server memory without bound.
+const MAX_BUFFERED_BYTES = 16 * 1024;
 
 export class VoiceSession {
   public userId: string;
@@ -59,6 +62,9 @@ export class VoiceSession {
 
   encodeAndSend(pcm: Float32Array, seq: number, timestamp: number): void {
     if (!this.active || this.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    if (this.ws.bufferedAmount > MAX_BUFFERED_BYTES) {
       return;
     }
 
