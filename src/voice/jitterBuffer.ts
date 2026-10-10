@@ -1,74 +1,31 @@
 const FRAME_SIZE = 960;
-const BUFFER_SIZE = 5;
-const MAX_MISSING_FRAMES = 2;
+const MAX_FRAMES = 5;
 
-interface JitterFrame {
-  seq: number;
-  pcm: Float32Array;
-  timestamp: number;
-}
-
+// Bounded FIFO of decoded frames. The mixer pops one frame per tick and gets
+// null when the sender is silent (muted, idle, or late). WebSocket delivery is
+// ordered, so there's no sequence prediction: a sender that pauses (mute) and
+// resumes is heard again immediately. When a burst overflows the buffer the
+// oldest frames are dropped to keep latency bounded.
 export class JitterBuffer {
-  private buffer: Map<number, JitterFrame> = new Map();
-  private expectedSeq: number = 0;
-  private missingFrameCount: number = 0;
-  private isInitialized: boolean = false;
+  private frames: Float32Array[] = [];
 
-  push(seq: number, pcm: Float32Array, timestamp: number): void {
-    if (!this.isInitialized) {
-      this.expectedSeq = seq;
-      this.isInitialized = true;
+  push(pcm: Float32Array): void {
+    if (this.frames.length >= MAX_FRAMES) {
+      this.frames.shift();
     }
-
-    if (seq < this.expectedSeq - MAX_MISSING_FRAMES) {
-      console.log(`[JITTER] Dropping old frame seq=${seq} expected=${this.expectedSeq}`);
-      return;
-    }
-
-    if (this.buffer.size >= BUFFER_SIZE) {
-      const oldestSeq = Math.min(...this.buffer.keys());
-      this.buffer.delete(oldestSeq);
-      console.log(`[JITTER] Buffer full, dropped oldest seq=${oldestSeq}`);
-    }
-
-    this.buffer.set(seq, { seq, pcm: pcm.slice(), timestamp });
+    this.frames.push(pcm);
   }
 
   pop(): Float32Array | null {
-    const frame = this.buffer.get(this.expectedSeq);
-
-    if (frame) {
-      this.buffer.delete(this.expectedSeq);
-      this.missingFrameCount = 0;
-      this.expectedSeq++;
-      return frame.pcm;
-    }
-
-    this.missingFrameCount++;
-
-    if (this.missingFrameCount > MAX_MISSING_FRAMES) {
-      console.log(`[JITTER] Skipping ${this.missingFrameCount} missing frames`);
-      this.expectedSeq += this.missingFrameCount;
-      this.missingFrameCount = 0;
-      return null;
-    }
-
-    return null;
+    return this.frames.shift() ?? null;
   }
 
   reset(): void {
-    this.buffer.clear();
-    this.expectedSeq = 0;
-    this.missingFrameCount = 0;
-    this.isInitialized = false;
-  }
-
-  getExpectedSeq(): number {
-    return this.expectedSeq;
+    this.frames = [];
   }
 
   isEmpty(): boolean {
-    return this.buffer.size === 0;
+    return this.frames.length === 0;
   }
 }
 

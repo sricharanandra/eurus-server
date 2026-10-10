@@ -43,14 +43,20 @@ export class RoomVoiceEngine {
     }
   }
 
-  processAudio(userId: string, seq: number, timestamp: number, opusData: Buffer): void {
+  // True when userId has a session bound to this exact socket. A replaced or
+  // stale connection for the same user doesn't count.
+  hasSession(userId: string, ws: WebSocket): boolean {
+    return this.sessions.get(userId)?.ws === ws;
+  }
+
+  processAudio(userId: string, ws: WebSocket, opusData: Buffer): void {
     const session = this.sessions.get(userId);
-    if (!session) {
+    if (!session || session.ws !== ws) {
       // Stray packets after cleanup are expected; drop silently.
       return;
     }
 
-    session.processAudio(seq, timestamp, opusData);
+    session.processAudio(opusData);
   }
 
   private startMixLoop(): void {

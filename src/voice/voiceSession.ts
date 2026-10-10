@@ -5,6 +5,9 @@ import { JitterBuffer, createSilenceFrame } from './jitterBuffer';
 const OPUS_SAMPLE_RATE = 48000;
 const OPUS_CHANNELS = 1;
 const FRAME_SIZE = 960;
+// Skip mixed frames while the socket backlog exceeds ~1s of audio so a stalled
+// client can't grow server memory without bound.
+const MAX_BUFFERED_BYTES = 16 * 1024;
 
 export class VoiceSession {
   public userId: string;
@@ -13,10 +16,7 @@ export class VoiceSession {
   public encoder: OpusEncoder;
   public decoder: OpusEncoder;
   public jitterBuffer: JitterBuffer;
-  public lastSeq: number = 0;
-  public lastTimestamp: number = 0;
   public active: boolean = true;
-  public currentPcm: Float32Array;
 
   private roomId: string;
 
@@ -28,14 +28,10 @@ export class VoiceSession {
     this.encoder = new OpusEncoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS);
     this.decoder = new OpusEncoder(OPUS_SAMPLE_RATE, OPUS_CHANNELS);
     this.jitterBuffer = new JitterBuffer();
-    this.currentPcm = createSilenceFrame();
   }
 
-  processAudio(seq: number, timestamp: number, opusData: Buffer): void {
+  processAudio(opusData: Buffer): void {
     if (!this.active) return;
-
-    this.lastSeq = seq;
-    this.lastTimestamp = timestamp;
 
     let decoded: Buffer;
     try {
@@ -56,12 +52,7 @@ export class VoiceSession {
       floatBuf[i] = sample / 32768.0;
     }
 
-    this.currentPcm = floatBuf;
-    this.jitterBuffer.push(seq, floatBuf, timestamp);
-  }
-
-  getPcm(): Float32Array {
-    return this.currentPcm;
+    this.jitterBuffer.push(floatBuf);
   }
 
   popMixedFrame(): Float32Array {
@@ -71,6 +62,9 @@ export class VoiceSession {
 
   encodeAndSend(pcm: Float32Array, seq: number, timestamp: number): void {
     if (!this.active || this.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    if (this.ws.bufferedAmount > MAX_BUFFERED_BYTES) {
       return;
     }
 
@@ -124,6 +118,5 @@ export class VoiceSession {
   destroy(): void {
     this.active = false;
     this.jitterBuffer.reset();
-    this.currentPcm = createSilenceFrame();
   }
 }
