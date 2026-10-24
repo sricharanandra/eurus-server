@@ -2,7 +2,6 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { ParsedKey, utils as sshUtils } from 'ssh2-streams';
 import nacl from 'tweetnacl';
-import forge from 'node-forge';
 import { prisma } from './database';
 import { JWTPayload, RegisterRequest, RegisterResponse, ChallengeResponse, VerifyResponse } from './types';
 
@@ -196,31 +195,41 @@ export async function verifySignature(
 
       const pubKeySSH = Buffer.from(key.getPublicSSH());
       
-      // Convert SSH RSA key to PEM format for node-forge
-      // SSH format: [length][e][length][n]
+      // Convert SSH RSA key (wire format: [length][e][length][n]) to a
+      // Node JWK public key. Strips mpint leading-zero padding first.
       let offset = 4; // Skip first length field
       const eLength = pubKeySSH.readUInt32BE(offset);
       offset += 4;
       const e = pubKeySSH.slice(offset, offset + eLength);
       offset += eLength;
-      
+
       const nLength = pubKeySSH.readUInt32BE(offset);
       offset += 4;
       const n = pubKeySSH.slice(offset, offset + nLength);
 
-      // Create forge RSA public key
-      const rsaPublicKey = forge.pki.setRsaPublicKey(
-        new forge.jsbn.BigInteger(n.toString('hex'), 16),
-        new forge.jsbn.BigInteger(e.toString('hex'), 16)
-      );
+      const stripLeadingZeros = (b: Buffer): Buffer => {
+        let i = 0;
+        while (i < b.length - 1 && b[i] === 0) i++;
+        return b.slice(i);
+      };
 
-      // Verify signature
-      const md = forge.md.sha256.create();
-      md.update(Buffer.from(challengeData.challenge, 'hex').toString('binary'));
-      
-      const valid = rsaPublicKey.verify(
-        md.digest().bytes(),
-        Buffer.from(signature, 'hex').toString('binary')
+      // Verify RSA-SHA256 (PKCS#1 v1.5) with Node's built-in crypto.
+      // Uses the same semantics as the old node-forge path (sign raw
+      // challenge bytes, verify raw signature bytes).
+      const publicKey = crypto.createPublicKey({
+        key: {
+          kty: 'RSA',
+          n: stripLeadingZeros(n).toString('base64url'),
+          e: stripLeadingZeros(e).toString('base64url'),
+        },
+        format: 'jwk',
+      });
+
+      const valid = crypto.verify(
+        'sha256',
+        Buffer.from(challengeData.challenge, 'hex'),
+        { key: publicKey, padding: crypto.constants.RSA_PKCS1_PADDING },
+        Buffer.from(signature, 'hex')
       );
 
       if (!valid) {
